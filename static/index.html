@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0b0f">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Dot">
+<title>Dot</title>
+<style>
+  :root { --bg:#0b0b0f; --card:#1a1c21; --text:#f2f3f5; --muted:#8b909a; --green:#34c759; --blue:#0a84ff; --amber:#ff9f0a; --red:#ff453a; }
+  * { box-sizing:border-box; margin:0; padding:0; -webkit-tap-highlight-color:transparent; }
+  html,body { height:100%; height:100dvh; background:var(--bg); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",sans-serif; }
+  /* bottom: half the home-indicator inset is enough; the full inset plus stage padding left a big empty band */
+  body { display:flex; flex-direction:column; padding:env(safe-area-inset-top) 12px max(2px, calc(env(safe-area-inset-bottom) - 30px)); }
+  header { padding:10px 2px 2px; display:flex; align-items:baseline; justify-content:space-between; }
+  header h1 { font-family:ui-serif,"New York",Georgia,serif; font-size:22px; font-weight:600; letter-spacing:.01em; }
+  #log { flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding:8px 0 12px; }
+  .msg { max-width:88%; font-size:17px; line-height:1.4; }
+  .msg.user { align-self:flex-end; padding:8px 13px; border-radius:18px; background:#1d2027; color:#c9ccd3; font-size:16px; }
+  .msg.assistant { align-self:flex-start; font-family:ui-serif,"New York",Georgia,serif; font-size:19px; color:var(--text); padding:2px 2px; }
+  #log { -webkit-mask-image:linear-gradient(to bottom, transparent 0, #000 22px); mask-image:linear-gradient(to bottom, transparent 0, #000 22px); }
+  .chip { align-self:center; font-size:13px; padding:6px 12px; border-radius:14px; background:#2a2418; color:var(--amber); }
+  .chip.err { background:#2b1a19; color:var(--red); }
+  button.chip { width:auto; max-width:none; border:0; font-size:14px; font-weight:600; padding:9px 16px; }
+  /* Dot */
+  /* in a call the header hides: Dot's name and status sit beside the face */
+  #top { display:flex; align-items:center; gap:14px; padding:12px 4px 6px; }
+  #who { display:flex; flex-direction:column; gap:2px; min-width:0; }
+  #name { font-family:ui-serif,"New York",Georgia,serif; font-size:24px; font-weight:600; }
+  #state { font-size:15px; color:var(--muted); }
+  body.incall header { display:none; }
+  /* session menu */
+  #toBtn { margin-left:auto; width:auto; max-width:46%; padding:9px 14px; border-radius:999px; background:#1d2027; color:#e6e7ea;
+           font-size:15px; font-weight:600; border:1px solid #2e323b; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #toMenu { position:fixed; inset:0; z-index:10; background:rgba(0,0,0,.55); display:flex; align-items:flex-start; justify-content:flex-end;
+            padding:calc(env(safe-area-inset-top) + 64px) 12px 12px; }
+  #toList { background:#16181d; border:1px solid #2e323b; border-radius:18px; padding:6px; width:min(260px, 100%);
+            max-height:calc(100dvh - 120px); overflow-y:auto; display:flex; flex-direction:column; gap:2px; }
+  #toList button { width:100%; max-width:none; text-align:left; background:transparent; color:#e6e7ea; font-size:16px; font-weight:500;
+                   padding:12px 14px; border-radius:12px; }
+  #toList button.sel { background:#2a2d34; font-weight:700; }
+  #toList hr { border:0; border-top:1px solid #2a2d34; margin:4px 8px; }
+  .face { position:relative; width:92px; height:92px; border-radius:50%; flex:none; transition:transform .09s linear; }
+  .face img { width:100%; height:100%; border-radius:50%; object-fit:cover; display:block; position:relative; z-index:1;
+              border:2px solid var(--bg); transition:filter .4s; }
+  .face::before { content:""; position:absolute; inset:-3px; border-radius:50%; z-index:0; opacity:.35;
+                  background:conic-gradient(from 0deg, #ffb38a, #ff6f61, #c04dff, #6ea8ff, #ffb38a); transition:opacity .4s; }
+  .face img.gone { display:none; }
+  .face.noimg { background:var(--bg); }
+  .face.noimg::before { opacity:.7; }
+  .face.big { width:104px; height:104px; animation:breathe 4.2s ease-in-out infinite; }
+  .face.big::before { opacity:.8; }
+  #orb.listening { animation:breathe 4.2s ease-in-out infinite; }
+  #orb.listening::before { opacity:.9; }
+  #orb.thinking::before, #orb.working::before { opacity:1; animation:spin 1.4s linear infinite; }
+  #orb.thinking img, #orb.working img { animation:tilt 2.4s ease-in-out infinite; }
+  #orb.speaking::before { opacity:1; animation:spin 3s linear infinite, glow .8s ease-in-out infinite; }
+  #orb.speaking { animation:speak .8s ease-in-out infinite; }
+  #orb:not(.listening):not(.thinking):not(.working):not(.speaking) img { filter:grayscale(.7) brightness(.7); }
+  @keyframes breathe { 0%,100% { scale:1; } 50% { scale:1.04; } }
+  @keyframes speak { 0%,100% { scale:1; } 50% { scale:1.06; } }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  @keyframes glow { 0%,100% { filter:blur(0); } 50% { filter:blur(4px); } }
+  @keyframes tilt { 0%,100% { transform:rotate(0); } 30% { transform:rotate(-4deg); } 70% { transform:rotate(4deg); } }
+  @media (prefers-reduced-motion: reduce) { .face, .face::before, .face img { animation:none !important; } }
+  button { font-size:18px; font-weight:600; border:0; border-radius:28px; padding:16px 34px; color:#fff; background:var(--green); width:100%; max-width:340px; }
+  button.end { background:var(--red); }
+  button.ghost { background:#2a2d34; font-size:15px; padding:10px 20px; width:auto; }
+  input { font-size:26px; letter-spacing:.35em; text-align:center; width:100%; max-width:340px; padding:14px; border-radius:16px; border:1px solid #333; background:var(--card); color:var(--text); }
+  #login { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:flex-start; gap:16px; text-align:center; padding-top:8px; }
+  #login p { color:var(--muted); font-size:15px; max-width:320px; line-height:1.4; }
+  #call { flex:1; display:flex; flex-direction:column; min-height:0; }
+  .hidden { display:none !important; }
+
+  #stage { display:flex; flex-direction:column; align-items:center; padding:2px 0 0; width:100%; }
+  .msg.live { opacity:.6; font-style:italic; }
+  /* one row of six */
+  #controls { display:flex; gap:6px; width:100%; max-width:480px; }
+  .ctl { flex:1 1 0; min-width:0; width:auto; max-width:none; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:3px;
+         min-height:62px; padding:8px 2px; border-radius:16px; background:#2a2d34; color:#f2f3f5; font-size:13px; font-weight:600; line-height:1.1; }
+  .ctl .ico { font-size:20px; line-height:1; }
+  .ctl .lbl { font-size:11.5px; font-weight:600; opacity:.9; white-space:nowrap; }
+  .ctl:active { transform:scale(.97); }
+  .ctl.on { background:#ff9f0a; color:#1a1200; }
+  .ctl.danger { background:#ff453a; color:#fff; }
+  #dbg { display:none; }
+  body.debug #dbg { display:block; }
+  #row { display:flex; gap:12px; }
+</style>
+</head>
+<body>
+<header><h1>Dot</h1><span id="ver" hidden>@@VERSION@@ &middot; @@BUILT@@</span></header>
+
+<!-- A real form with username + current-password lets iOS save the PIN in iCloud Keychain and fill it with Face ID.
+    The server still checks the PIN; nothing about auth changed. -->
+<form id="login" action="#" method="post" autocomplete="on">
+  <div class="face big" id="loginFace"><img src="/dot/dot-real.jpg" alt="Dot"></div>
+  <p>Hi @@OWNER@@, it's @@ASSISTANT@@. Enter your PIN to talk.</p>
+  <input id="user" name="username" type="text" autocomplete="username" value="@@USER@@" readonly style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0" tabindex="-1" aria-hidden="true">
+  <input id="pin" name="password" type="password" inputmode="numeric" autocomplete="current-password" maxlength="12" placeholder="&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;">
+  <button id="start" type="submit">Talk to Dot</button>
+  <p id="loginMsg"></p>
+</form>
+
+<section id="call" class="hidden">
+  <div id="top"><div class="face" id="orb" title="Tap to change Dot's look"><img id="dotImg" src="/dot/dot-real.jpg" alt="Dot"></div>
+    <div id="who"><div id="name">Dot</div><div id="state"></div></div>
+    <button id="toBtn" type="button" aria-label="Choose who you talk to">&#9776; <span id="toLbl">Auto</span></button></div>
+  <div id="toMenu" class="hidden"><div id="toList"></div></div>
+  <div id="log"></div>
+  <div id="dbg" style="font:11px monospace;opacity:.6;padding:4px 12px"></div>
+  <div id="stage">
+    <div id="controls">
+      <button class="ctl" id="mute"><span class="ico">&#127908;</span><span class="lbl">Mute</span></button>
+      <button class="ctl" id="stopTalk"><span class="ico">&#9197;</span><span class="lbl">Skip</span></button>
+      <button class="ctl" id="earsBtn"><span class="ico">&#128066;</span><span class="lbl">Phone</span></button>
+      <button class="ctl" id="langBtn"><span class="ico">&#127760;</span><span class="lbl">EN</span></button>
+      <button class="ctl danger" id="end"><span class="ico">&#9742;</span><span class="lbl">End</span></button>
+    </div>
+  </div>
+</section>
+
+<script>
+"use strict";
+// ---------------------------------------------------------------- settings
+const TARGET_RATE = 16000;
+const HANGOVER_MS = 700;          // silence that ends an utterance
+const MIN_SPEECH_MS = 350;        // shorter than this is a click, not speech
+const MAX_UTTERANCE_S = 30;
+const PREROLL_MS = 300;
+const BARGE_IN_MS = 400;          // sustained speech needed to interrupt the assistant
+const MIN_THRESHOLD = 0.015;
+const LABELS = { listening:"Listening", thinking:"Thinking",
+                 speaking:"Speaking", working:"Handing over",
+                 connecting:"Connecting", muted:"Muted" };
+
+// ---------------------------------------------------------------- state
+let ws = null, pin = "", ctx = null, stream = null, node = null, wakeLock = null;
+let inCall = false, muted = false, serverState = "connecting";
+let playing = false, dropAudio = false, ackPending = 0, genId = 0;
+let sources = [], nextTime = 0, decodeChain = Promise.resolve();
+let reconnectTries = 0, starting = false;
+let keptStream = null;
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let earsPhone = !!SR, recog = null, recogWant = false, recogLang = "en-US", lastPlayAt = 0;
+let sentN = 0, lastMsg = '', dbgAt = 0, lastLevel = 0, lastThr = 0;
+let phoneVoice = false, speakCount = 0;   // default: Qwen voice from the Mac
+let speechEndAt = 0, metricSent = true;
+const SEND_PAUSE_MS = 1100;   // 800 cut the caller off mid-thought   // phone ears: quiet time after the last words before the sentence is sent
+let heard = "", heardTimer = null, interim = "";
+// VAD
+let noiseFloor = 0.01, quietMs = 0, inSpeech = false, speechMs = 0, silenceMs = 0, loudMs = 0;
+let utter = [], preroll = [], prerollSamples = 0, utterSamples = 0;
+
+const $ = id => document.getElementById(id);
+function store(k, v) { try { if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v); } catch (e) {} }
+function load(k) { try { return localStorage.getItem(k) || ""; } catch (e) { return ""; } }
+
+function setState(s) {
+  serverState = s;
+  render();
+}
+let busySince = 0, busyTimer = null;
+function render() {
+  let s = playing ? "speaking" : serverState;
+  if (muted && s === "listening") s = "muted";
+  const busy = (s === "thinking" || s === "working");
+  if (earsPhone && recogWant) {
+    // Ears stay off for the whole reply, not just while a sound part plays: Qwen leaves 1-2 s gaps between sentences, the
+    // ears switched on in each gap, heard the assistant itself and iOS's audio-mode switch made the voice choppy
+    //.
+    if (playing || s === "thinking" || serverState === "speaking" || serverState === "working") { lastPlayAt = Date.now(); stopRecog(); showLive(""); }
+    else if (!recog && inCall) { if (Date.now() - lastPlayAt > 500) startRecog(); else setTimeout(render, 520); }
+  }
+  if (busy && !busySince) { busySince = Date.now(); busyTimer = setInterval(render, 250); }
+  if (!busy && busySince) { busySince = 0; clearInterval(busyTimer); busyTimer = null; }
+  const secs = busy ? " " + ((Date.now() - busySince) / 1000).toFixed(1) + "s" : "";
+  $("state").textContent = (LABELS[s] || "") + secs;
+  $("orb").className = "face " + ((s === "muted") ? "" : s);
+}
+function addMsg(role, text) {
+  const d = document.createElement("div");
+  d.className = "msg " + role; d.textContent = text;
+  $("log").appendChild(d); $("log").scrollTop = $("log").scrollHeight;
+}
+function addChip(text, err) {
+  const d = document.createElement("div");
+  d.className = "chip" + (err ? " err" : ""); d.textContent = text;
+  $("log").appendChild(d); $("log").scrollTop = $("log").scrollHeight;
+}
+
+// ---------------------------------------------------------------- websocket
+function wsUrl() { return (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws"; }
+
+function connect() {
+  return new Promise((resolve, reject) => {
+    setState("connecting");
+    ws = new WebSocket(wsUrl());
+    ws.binaryType = "arraybuffer";
+    let settled = false;
+    ws.onopen = () => ws.send(JSON.stringify({ type: "auth", pin: pin, passkey: resumeToken ? null : faceCred,
+      resume: resumeToken || "", target: target, voice: phoneVoice ? "phone" : "mac", ears: earsPhone ? "phone" : "mac", standalone: !!navigator.standalone }));
+    ws.onmessage = ev => {
+      if (typeof ev.data !== "string") { onAudio(ev.data); return; }
+      const m = JSON.parse(ev.data);
+      if (m.type === "auth_ok") {
+        if (m.targets) buildTargets(m.targets);
+        settled = true; reconnectTries = 0; faceCred = null;
+        if (m.resume) resumeToken = m.resume;   // reconnects in this call: no PIN, no Face ID again
+        if (pin && window.PublicKeyCredential && m.passkeys === 0) ws.send(JSON.stringify({ type: "passkey_register_options" }));
+        resolve();
+      }
+      else if (m.type === "auth_fail" || m.type === "auth_retry") { settled = true; reject(m); }
+      else onMessage(m);
+    };
+    ws.onerror = () => { if (!settled) { settled = true; reject({ type: "net" }); } };
+    ws.onclose = () => { if (!settled) { settled = true; reject({ type: "net" }); } else if (inCall) onDrop(); };
+  });
+}
+
+function onMessage(m) {
+  lastMsg = m.type + (m.state ? ':' + m.state : '');
+  if (m.type === "status") {
+    if (m.state === "listening" && ackPending > 0) { ackPending--; dropAudio = ackPending > 0; }
+    setState(m.state);
+  } else if (m.type === "transcript") addMsg(m.role, m.text);
+  else if (m.type === "handoff") addChip("Handed to " + (m.to || "a session") + ": " + m.text, false);
+  else if (m.type === "say") speakText(m.text);
+  else if (m.type === "passkey_options") offerFaceId(m.options);
+  else if (m.type === "voice_used") addChip("Qwen was slow, so the Mac voice spoke this time.", false);
+  else if (m.type === "passkey_ok") { addChip("Face ID is on. Next time just tap Talk to Dot.", false); }
+  else if (m.type === "passkey_fail") addChip("Face ID setup did not work. The PIN still works.", true);
+  else if (m.type === "error") addChip("Error: " + m.message, true);
+}
+
+async function onDrop() {
+  if (!inCall) return;
+  addChip("Connection lost", true);
+  while (inCall && reconnectTries < 6) {
+    reconnectTries++;
+    await new Promise(r => setTimeout(r, Math.min(1000 * reconnectTries, 5000)));
+    try { await connect(); addChip("Reconnected", false); return; } catch (e) { if (e && e.type === "auth_fail") break; }
+  }
+  if (inCall) { addChip("Could not reconnect. Tap End call, then start again.", true); }
+}
+
+
+// ---------------------------------------------------------------- phone voice (the iPhone speaks; no audio travels from the Mac)
+function pickVoice(zh) {
+  let vs = [];
+  try { vs = speechSynthesis.getVoices() || []; } catch (e) {}
+  const lang = zh ? /^zh[-_]cn|^zh$/i : /^en[-_]/i;
+  const ok = vs.filter(v => lang.test(v.lang || ""));
+  const best = ok.find(v => /premium|enhanced/i.test(v.name)) || ok.find(v => /ting|xiaoxiao|samantha|ava|allison/i.test(v.name)) || ok[0];
+  return best || null;
+}
+function splitPieces(text) {
+  return (String(text).match(/[^.!?\u3002\uff01\uff1f\n]+[.!?\u3002\uff01\uff1f]*/g) || [String(text)]).map(s => s.trim()).filter(Boolean);
+}
+function speakText(text) {
+  if (dropAudio || !phoneVoice || !('speechSynthesis' in window)) return;
+  const gen = genId;
+  splitPieces(text).forEach(piece => {
+    const u = new SpeechSynthesisUtterance(piece);
+    const zh = /[\u4e00-\u9fff]/.test(piece);
+    u.lang = zh ? "zh-CN" : "en-US";
+    const v = pickVoice(zh); if (v) u.voice = v;
+    u.rate = 1.05;
+    u.onstart = () => { if (gen === genId) { playing = true; render(); reportFirstSound(0); } };
+    const done = () => { speakCount = Math.max(0, speakCount - 1); if (!speakCount) { playing = false; loudMs = 0; render(); } };
+    u.onend = done; u.onerror = done;
+    speakCount++;
+    speechSynthesis.speak(u);
+  });
+}
+function unlockSpeech() {   // iOS only allows speech after a tap
+  try { if ('speechSynthesis' in window) { speechSynthesis.getVoices(); const u = new SpeechSynthesisUtterance(" "); u.volume = 0; speechSynthesis.speak(u); } } catch (e) {}
+}
+try { if (location.search.indexOf('debug') >= 0) document.body.classList.add('debug'); } catch (e) {}
+
+// ---------------------------------------------------------------- phone ears (the iPhone's own speech recognition; the Mac does no listening)
+function sendText(t, waitedMs) {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: "text", text: t }));
+  speechEndAt = performance.now() - (waitedMs || 0); metricSent = false;   // phone ears: the caller stopped about waitedMs ago
+  stopRecog();   // switch the ears off now, while it thinks: iOS changing audio mode as the reply started broke its first second
+  setState("thinking");
+}
+function showLive(t) {
+  let d = $("liveMsg");
+  if (!t) { if (d) d.remove(); return; }
+  if (!d) { d = document.createElement("div"); d.id = "liveMsg"; d.className = "msg user live"; $("log").appendChild(d); }
+  d.textContent = t; $("log").scrollTop = $("log").scrollHeight;
+}
+function startRecog() {
+  if (!SR || recog || !recogWant || !inCall && !starting) return;
+  const r = new SR();
+  r.lang = recogLang; r.continuous = true; r.interimResults = true;
+  r.onresult = ev => {
+    for (let i = ev.resultIndex; i < ev.results.length; i++) {
+      const res = ev.results[i];
+      if (res.isFinal) { const t = (res[0].transcript || "").trim(); if (t) heard = (heard + " " + t).trim(); }
+    }
+    let live = "";   // words appear while the caller is still talking (interim results), replaced by the real line when sent
+    for (let i = 0; i < ev.results.length; i++) if (!ev.results[i].isFinal) live += ev.results[i][0].transcript || "";
+    interim = live.trim();
+    showLive((heard + " " + live).trim());
+    // iOS ends a "final" result at any short pause, which cut sentences in half ("So tell the voice task to move the").
+    // Send only after SEND_PAUSE_MS with no new words, joining the pieces.
+    clearTimeout(heardTimer);
+    const wait = live ? SEND_PAUSE_MS + 600 : SEND_PAUSE_MS;   // a final with nothing pending already means the caller paused
+    if (heard) heardTimer = setTimeout(() => { const t = heard; heard = ""; if (t) { showLive(""); sendText(t, wait); } }, wait);
+  };
+  r.onerror = e => {
+    lastMsg = "ears:" + e.error;
+    if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+      recogWant = false;
+      addChip("Speech recognition is blocked. Allow Microphone and Speech Recognition for this site in Safari settings, or tap Ears to use the Mac.", true);
+    }
+  };
+  r.onend = () => {
+    if (recog === r) recog = null;
+    // iOS ends the session by itself (pauses, ~1 min) and throws away words not yet marked final: they were lost.
+    if (interim) {
+      heard = (heard + " " + interim).trim(); interim = "";
+      clearTimeout(heardTimer);
+      heardTimer = setTimeout(() => { const t = heard; heard = ""; if (t) { showLive(""); sendText(t, SEND_PAUSE_MS); } }, SEND_PAUSE_MS);
+    }
+    if (recogWant && inCall) setTimeout(() => { render(); }, 50);   // back on fast so the next words are caught
+  };
+  try { r.start(); recog = r; } catch (e) { recog = null; }
+}
+function stopRecog() {
+  const r = recog; recog = null; interim = "";
+  if (heard && !inCall) { heard = ""; clearTimeout(heardTimer); }
+  if (r) { r.onend = null; r.onresult = null; try { r.abort(); } catch (e) {} }
+}
+function setEarsButton() {
+  $("earsBtn").querySelector(".lbl").textContent = earsPhone ? "Phone" : "Mac";
+  $("langBtn").querySelector(".lbl").textContent = recogLang === "zh-CN" ? "ZH" : "EN";
+  $("langBtn").style.display = earsPhone ? "" : "none";
+}
+async function startAudioOnly() {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  ctx = new AC();
+  if (ctx.state === "suspended") await ctx.resume();
+  keepOutputAlive();
+}
+// A faint constant signal keeps the audio route awake, so the first second of a reply is not ducked or ramped up by the phone.
+function keepOutputAlive() {
+  try {
+    if (!ctx) return;
+    const b = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
+    const d = b.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * 0.00002;
+    const s = ctx.createBufferSource(); s.buffer = b; s.loop = true;
+    const g = ctx.createGain(); g.gain.value = 1;
+    s.connect(g); g.connect(ctx.destination); s.start();
+  } catch (e) {}
+}
+
+// ---------------------------------------------------------------- playback
+function onAudio(buf) {
+  if (dropAudio || !ctx) return;
+  const gen = genId;
+  decodeChain = decodeChain.then(() => decode(buf.slice(0))).then(ab => {
+    if (!ab || gen !== genId || dropAudio) return;
+    const src = ctx.createBufferSource();
+    src.buffer = ab;
+    const g = ctx.createGain();
+    src.connect(g); g.connect(ctx.destination);
+    const first = !sources.length;
+    const t = Math.max(ctx.currentTime + (first ? 0.18 : 0.02), nextTime);   // a short lead-in lets the phone settle its volume first
+    if (first) { g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(1, t + 0.06); reportFirstSound((t - ctx.currentTime) * 1000); }
+    src.start(t); nextTime = t + ab.duration;
+    sources.push(src); playing = true; render();
+    src.onended = () => {
+      sources = sources.filter(s => s !== src);
+      if (!sources.length) { playing = false; loudMs = 0; render(); }
+    };
+  }).catch(() => {});
+}
+function decode(arrayBuffer) {
+  return new Promise((resolve, reject) => {
+    const p = ctx.decodeAudioData(arrayBuffer, resolve, reject);
+    if (p && p.then) p.then(resolve, reject);
+  });
+}
+function reportFirstSound(delayMs) {   // the real wait: end of the caller's speech -> first reply sound (logged as phone_e2e_ms)
+  if (metricSent || !speechEndAt || !ws || ws.readyState !== 1) return;
+  metricSent = true;
+  ws.send(JSON.stringify({ type: "metric", e2e_ms: Math.round(performance.now() + (delayMs || 0) - speechEndAt) }));
+}
+function stopPlayback() {
+  genId++; metricSent = true;
+  sources.forEach(s => { try { s.onended = null; s.stop(); } catch (e) {} });
+  sources = []; nextTime = 0; playing = false;
+  try { if ('speechSynthesis' in window) speechSynthesis.cancel(); } catch (e) {}
+  speakCount = 0; render();
+}
+function interrupt() {
+  stopPlayback();
+  dropAudio = true; ackPending++;
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "interrupt" }));
+}
+
+// ---------------------------------------------------------------- microphone + voice activity detection
+const WORKLET = `
+class Tap extends AudioWorkletProcessor {
+  process(inputs) { const c = inputs[0] && inputs[0][0]; if (c) this.port.postMessage(c.slice(0)); return true; }
+}
+registerProcessor("tap", Tap);`;
+
+async function startMic() {
+  // Ask for the microphone once per page load and keep it: iPhone Safari asks again on every new request, so ending a call
+  // only switches the tracks off (enabled=false) and the next call reuses the same permission.
+  const live = keptStream && keptStream.getAudioTracks().some(t => t.readyState === "live");
+  if (!live) keptStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+  keptStream.getAudioTracks().forEach(t => { t.enabled = true; });
+  stream = keptStream;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  ctx = new AC();
+  if (ctx.state === "suspended") await ctx.resume();
+  const url = URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" }));
+  await ctx.audioWorklet.addModule(url);
+  const src = ctx.createMediaStreamSource(stream);
+  node = new AudioWorkletNode(ctx, "tap");
+  node.port.onmessage = e => onFrame(e.data);
+  src.connect(node);
+  keepOutputAlive();
+  const mute = ctx.createGain(); mute.gain.value = 0;   // keep the graph running without echoing the mic
+  node.connect(mute); mute.connect(ctx.destination);
+}
+
+function downsample(f32, inRate) {
+  if (inRate === TARGET_RATE) return f32;
+  const ratio = inRate / TARGET_RATE, n = Math.floor(f32.length / ratio), out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const pos = i * ratio, i0 = Math.floor(pos), i1 = Math.min(i0 + 1, f32.length - 1), fr = pos - i0;
+    out[i] = f32[i0] * (1 - fr) + f32[i1] * fr;
+  }
+  return out;
+}
+function rms(f32) { let s = 0; for (let i = 0; i < f32.length; i++) s += f32[i] * f32[i]; return Math.sqrt(s / f32.length); }
+
+function onFrame(raw) {
+  if (!inCall || muted || earsPhone || !ws || ws.readyState !== 1) return;
+  const frameMs = raw.length / ctx.sampleRate * 1000;
+  const level = rms(raw);
+  const pcm = downsample(raw, ctx.sampleRate);
+
+  // While the assistant talks, its own voice leaks into the mic: demand much louder, longer speech to barge in.
+  const factor = playing ? 3.0 : 1.0;
+  const thr = Math.max(MIN_THRESHOLD, noiseFloor * 3) * factor;
+  const loud = level > thr;
+  lastLevel = level; lastThr = thr;
+  if (!playing) { const o = $("orb"); if (o) o.style.transform = "scale(" + (1 + Math.min(0.35, level * 4)).toFixed(3) + ")"; }
+  const nowT = Date.now();
+  if (nowT - dbgAt > 400) { dbgAt = nowT; const d = $("dbg"); if (d) d.textContent = "mic " + level.toFixed(3) + " / need " + thr.toFixed(3) + " | sent " + sentN + " | ws " + (ws ? ws.readyState : "-") + " | " + lastMsg; }
+  // Noise floor: follows quiet moments down quickly, creeps up slowly, and is capped so speech can never raise it much.
+  if (!inSpeech && !loud && quietMs > 1000) {
+    noiseFloor = level < noiseFloor ? noiseFloor * 0.8 + level * 0.2 : noiseFloor * 0.995 + level * 0.005;
+    noiseFloor = Math.min(noiseFloor, 0.02);
+  }
+  quietMs = loud || inSpeech ? 0 : quietMs + frameMs;
+
+  if (!inSpeech) {
+    preroll.push(pcm); prerollSamples += pcm.length;
+    while (prerollSamples > TARGET_RATE * PREROLL_MS / 1000 && preroll.length > 1) prerollSamples -= preroll.shift().length;
+    loudMs = loud ? loudMs + frameMs : Math.max(0, loudMs - frameMs * 0.5);   // leaky: syllable gaps do not reset it
+    const need = playing ? BARGE_IN_MS : 120;
+    if (loudMs >= need) {
+      if (playing) interrupt();
+      inSpeech = true; speechMs = loudMs; silenceMs = 0;
+      utter = preroll.slice(); utterSamples = prerollSamples; preroll = []; prerollSamples = 0; loudMs = 0;
+    }
+    return;
+  }
+  utter.push(pcm); utterSamples += pcm.length;
+  if (loud) { speechMs += frameMs; silenceMs = 0; } else silenceMs += frameMs;
+  if (silenceMs >= HANGOVER_MS || utterSamples >= TARGET_RATE * MAX_UTTERANCE_S) finishUtterance();
+}
+
+function finishUtterance() {
+  inSpeech = false;
+  const enough = speechMs >= MIN_SPEECH_MS;
+  const chunks = utter; const total = utterSamples;
+  utter = []; utterSamples = 0; speechMs = 0; silenceMs = 0;
+  if (!enough || !ws || ws.readyState !== 1) return;
+  const out = new Int16Array(total); let o = 0;
+  for (const c of chunks) for (let i = 0; i < c.length; i++) { const s = Math.max(-1, Math.min(1, c[i])); out[o++] = s < 0 ? s * 32768 : s * 32767; }
+  ws.send(out.buffer); sentN++;
+  speechEndAt = performance.now() - HANGOVER_MS; metricSent = false;   // the caller stopped talking HANGOVER_MS ago
+  setState("thinking");
+}
+
+// ---------------------------------------------------------------- call control
+async function acquireWakeLock() {
+  try { if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {}
+}
+document.addEventListener("visibilitychange", () => { if (inCall && document.visibilityState === "visible") acquireWakeLock(); });
+
+async function startCall() {
+  pin = $("pin").value.trim();
+  // Face ID first, while the tap is fresh, before the speech and microphone prompts
+  resumeToken = ""; faceCred = null;
+  let faceP = null;
+  if (!pin && faceOpts) {
+    const o = faceOpts; faceOpts = null;
+    faceP = navigator.credentials.get({ publicKey: getOptions(o) });
+  }
+  phoneVoice = false; unlockSpeech();   // Qwen voice locked; the Voice button is gone
+  earsPhone = !!SR && load('ears') !== 'mac'; recogLang = load('lang') === 'zh-CN' ? 'zh-CN' : 'en-US'; setEarsButton();
+  recogWant = earsPhone; starting = true; if (earsPhone) startRecog();   // must start inside the tap so iOS asks for permission
+  if (!pin && !faceP) { $("loginMsg").textContent = "PIN?"; return; }
+  $("start").disabled = true; $("loginMsg").textContent = "";
+  try { if (navigator.audioSession) navigator.audioSession.type = "play-and-record"; } catch (e) {}   // iPhone: play even with the silent switch on
+  try {
+    if (earsPhone) await startAudioOnly(); else await startMic();   // must run inside the tap so iOS allows audio
+    if (faceP) { try { faceCred = credJSON(await faceP); } catch (e) { prefetchFaceOpts(); throw { type: "face" }; } }
+    await connect();
+  } catch (e) {
+    $("start").disabled = false; starting = false;
+    stopEverything();
+    if (e && e.type === "face") { $("loginMsg").textContent = "Face ID cancelled. Tap again or type the PIN."; stopEverything(); return; }
+    if (e && (e.type === "auth_fail" || e.type === "auth_retry")) prefetchFaceOpts();
+    if (e && e.type === "auth_retry") { $("loginMsg").textContent = "Tap again."; stopEverything(); return; }
+    if (e && e.type === "auth_fail" && e.face && !e.locked_s) { $("loginMsg").textContent = "Face ID did not work. Tap again or type the PIN."; stopEverything(); return; }
+    if (e && e.type === "auth_fail") $("loginMsg").textContent = e.locked_s ? "Too many tries. Wait " + Math.ceil(e.locked_s / 60) + " min." : "Wrong PIN";
+    else if (e && e.type === "net") $("loginMsg").textContent = "Cannot reach the Mac. Is the service running and Tailscale on?";
+    else $("loginMsg").textContent = "Microphone blocked or unavailable. Allow it in Settings.";
+    return;
+  }
+  starting = false; inCall = true; muted = false;
+  $("login").classList.add("hidden"); $("call").classList.remove("hidden"); document.body.classList.add("incall");
+  $("log").innerHTML = ""; acquireWakeLock(); render();
+}
+
+function stopEverything() {
+  inCall = false; recogWant = false; stopRecog(); stopPlayback();
+  try { if (ws) { ws.onclose = null; ws.close(); } } catch (e) {}
+  try { if (node) node.disconnect(); } catch (e) {}
+  try { if (stream) stream.getTracks().forEach(t => { t.enabled = false; }); } catch (e) {}   // keep the permission; the mic is silent between calls
+  try { if (ctx) ctx.close(); } catch (e) {}
+  try { if (wakeLock) wakeLock.release(); } catch (e) {}
+  ws = node = stream = ctx = wakeLock = null;
+  inSpeech = false; utter = []; preroll = []; utterSamples = prerollSamples = 0;
+}
+function endCall() {
+  stopEverything();
+  $("call").classList.add("hidden"); $("login").classList.remove("hidden"); document.body.classList.remove("incall");
+  $("start").disabled = false; $("pin").value = ""; $("state").textContent = ""; resumeToken = ""; prefetchFaceOpts();
+}
+
+// ---------------------------------------------------------------- Face ID (passkey). The PIN enrolls the phone once and stays the fallback.
+let faceOpts = null, faceCred = null, resumeToken = "";
+const b64u = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const unb64u = s => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4)), c => c.charCodeAt(0));
+function getOptions(o) {
+  return Object.assign({}, o, { challenge: unb64u(o.challenge), allowCredentials: (o.allowCredentials || []).map(c => Object.assign({}, c, { id: unb64u(c.id) })) });
+}
+function createOptions(o) {
+  return Object.assign({}, o, { challenge: unb64u(o.challenge), user: Object.assign({}, o.user, { id: unb64u(o.user.id) }),
+    excludeCredentials: (o.excludeCredentials || []).map(c => Object.assign({}, c, { id: unb64u(c.id) })) });
+}
+function credJSON(c) {
+  const r = c.response, out = { id: c.id, rawId: b64u(c.rawId), type: c.type, clientExtensionResults: {}, response: { clientDataJSON: b64u(r.clientDataJSON) } };
+  if (r.authenticatorData) { out.response.authenticatorData = b64u(r.authenticatorData); out.response.signature = b64u(r.signature);
+    if (r.userHandle) out.response.userHandle = b64u(r.userHandle); }
+  if (r.attestationObject) { out.response.attestationObject = b64u(r.attestationObject); if (r.getTransports) out.response.transports = r.getTransports(); }
+  return out;
+}
+async function prefetchFaceOpts() {   // fetched ahead so Face ID starts right inside the tap (iOS wants that)
+  faceOpts = null;
+  if (!window.PublicKeyCredential) return;
+  try { const r = await fetch("/passkey/login-options", { cache: "no-store" }); if (r.ok) faceOpts = await r.json(); } catch (e) {}   // 404 = no phone enrolled yet
+  $("start").textContent = faceOpts ? "Talk to Dot (Face ID)" : "Talk to Dot";
+}
+function offerFaceId(opts) {
+  const b = document.createElement("button");
+  b.className = "chip"; b.textContent = "Use Face ID next time (tap)";
+  b.onclick = async () => {
+    b.disabled = true;
+    try {
+      const c = await navigator.credentials.create({ publicKey: createOptions(opts) });
+      ws.send(JSON.stringify({ type: "passkey_register", credential: credJSON(c) }));
+      b.remove();
+    } catch (e) { b.textContent = e && e.name === "InvalidStateError" ? "Face ID is already set up on this phone" : "Face ID setup cancelled"; }
+  };
+  $("log").appendChild(b);
+}
+prefetchFaceOpts();
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && !inCall) prefetchFaceOpts(); });
+
+$("login").addEventListener("submit", e => { e.preventDefault(); startCall(); });   // submit (tap or Enter) keeps the user gesture
+$("end").onclick = endCall;
+$("earsBtn").onclick = async () => {
+  if (!SR || !inCall) return;
+  earsPhone = !earsPhone; store('ears', earsPhone ? 'phone' : 'mac'); setEarsButton();
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "ears", mode: earsPhone ? "phone" : "mac" }));
+  if (earsPhone) {
+    try { if (node) node.disconnect(); } catch (e) {} node = null;
+    try { if (stream) stream.getTracks().forEach(t => { t.enabled = false; }); } catch (e) {}
+    recogWant = true; startRecog();
+  } else {
+    recogWant = false; stopRecog();
+    try { await startMic(); } catch (e) { addChip("Microphone unavailable", true); }
+  }
+};
+$("langBtn").onclick = () => {
+  recogLang = recogLang === "zh-CN" ? "en-US" : "zh-CN"; store('lang', recogLang); setEarsButton();
+  if (recog) { stopRecog(); }   // render restarts it with the new language
+  render();
+};
+$("stopTalk").onclick = () => { if (inCall) interrupt(); };
+const LOOKS = ["/dot/dot-real.jpg", "/dot/dot-cartoon.jpg"];
+function faceImg(img, src) {
+  const box = img.parentNode;
+  img.onerror = () => { img.classList.add("gone"); box.classList.add("noimg"); };   // no picture: show the ring look only
+  img.onload = () => { img.classList.remove("gone"); box.classList.remove("noimg"); };
+  img.src = src;
+}
+function setLook(i) { const src = LOOKS[(i + LOOKS.length) % LOOKS.length]; faceImg($("dotImg"), src); faceImg($("loginFace").querySelector("img"), src); }
+let look = parseInt(load("dotLook") || "0", 10) || 0; setLook(look);
+$("orb").onclick = () => { look = (look + 1) % LOOKS.length; store("dotLook", String(look)); setLook(look); };
+// ---------------------------------------------------------------- who the caller talks to (menu at the top)
+let target = load("target") || "AUTO", targets = [["AUTO", "Auto"]];
+function targetLabel() { const t = targets.find(x => x[0] === target); return t ? t[1] : "Auto"; }
+function buildTargets(list) {
+  targets = list;
+  if (!targets.some(x => x[0] === target)) target = "AUTO";
+  $("toLbl").textContent = targetLabel();
+  const box = $("toList"); box.innerHTML = "";
+  targets.forEach(([k, label], i) => {
+    if (i === 3) box.appendChild(document.createElement("hr"));   // Auto / ORG / Dot, then the sessions
+    const b = document.createElement("button"); b.type = "button"; b.textContent = label;
+    if (k === target) b.className = "sel";
+    b.onclick = () => {
+      target = k; store("target", k); $("toLbl").textContent = label; $("toMenu").classList.add("hidden");
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "target", role: k }));
+      addChip(k === "AUTO" ? "Talking to Dot; it sends work to the right session." : "Talking to " + label + ": work goes straight there.", false);
+      buildTargets(targets);
+    };
+    box.appendChild(b);
+  });
+}
+$("toBtn").onclick = () => $("toMenu").classList.remove("hidden");
+$("toMenu").onclick = e => { if (e.target === $("toMenu")) $("toMenu").classList.add("hidden"); };
+$("mute").onclick = () => { muted = !muted; $("mute").classList.toggle("on", muted); $("mute").querySelector(".lbl").textContent = muted ? "Unmute" : "Mute"; if (muted) { inSpeech = false; utter = []; stopRecog(); } recogWant = earsPhone && !muted; render(); };
+</script>
+</body>
+</html>

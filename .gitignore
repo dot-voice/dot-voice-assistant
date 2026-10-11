@@ -1,0 +1,14 @@
+.venv*/
+__pycache__/
+*.pyc
+local_config.json
+pin.txt
+passkeys.json
+logs/
+handoff/
+updates/
+brain.txt
+*.key
+*.crt
+static/dot/*.jpg
+.claude/

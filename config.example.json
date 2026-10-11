@@ -1,0 +1,119 @@
+{
+  "owner": "Alex",
+  "assistant": "Dot",
+  "assistant_note": "",
+  "owner_job": "a busy professional who works on the road",
+  "style_language": "Reply in the language they spoke; if they speak English, answer in English.",
+  "style_extra": "Keep it to one thing at a time.",
+  "sessions_description": "- Work runs in separate agent sessions, each owning one module: CRM (client records), WEBSITE (the public site), RESEARCH (looking things up). ORG routes work. When they ask \"what is going on\", \"status\" or about a session, use the SESSIONS STATUS block.",
+  "lookup_names": [
+    "sam",
+    "jordan"
+  ],
+  "stt_vocabulary": "Alex, Sam, Jordan, Casey.",
+  "places": {
+    "london": [
+      51.5072,
+      -0.1276
+    ],
+    "paris": [
+      48.8566,
+      2.3522
+    ]
+  },
+  "default_place": "london",
+  "timezone": "Europe/London",
+  "time_label": "London",
+  "carry_script": "~/.dot/carry.py",
+  "handoff_targets": [
+    [
+      "AUTO",
+      "Auto"
+    ],
+    [
+      "ORG",
+      "ORG"
+    ],
+    [
+      "VOICE",
+      "Dot (this call)"
+    ],
+    [
+      "CRM",
+      "CRM"
+    ],
+    [
+      "WEBSITE",
+      "Website"
+    ],
+    [
+      "RESEARCH",
+      "Research"
+    ]
+  ],
+  "handoff_routes": [
+    [
+      "VOICE",
+      "\\bthis call\\b|\\bcall page\\b|\\bmicrophone\\b|\\bbuttons?\\b|\\bdot\\b"
+    ],
+    [
+      "CRM",
+      "\\bcrm\\b"
+    ],
+    [
+      "WEBSITE",
+      "\\bwebsite\\b|\\bsite\\b"
+    ],
+    [
+      "RESEARCH",
+      "\\bresearch\\b"
+    ]
+  ],
+  "session_aliases": [
+    [
+      "ORG",
+      "org|organi[sz]er"
+    ],
+    [
+      "CRM",
+      "crm"
+    ],
+    [
+      "WEBSITE",
+      "website|site"
+    ],
+    [
+      "RESEARCH",
+      "research"
+    ],
+    [
+      "VOICE",
+      "voice"
+    ]
+  ],
+  "session_names": [
+    "org",
+    "crm",
+    "website",
+    "research"
+  ],
+  "private_roles": [],
+  "carryover_dir": "~/.dot/carryover",
+  "roles_json": "~/.dot/roles.json",
+  "team_jobs_dir": "~/.dot/team/jobs",
+  "rp_id": "dot.example.ts.net",
+  "updates_dir": "~/.dot/updates",
+  "brain_tool": "~/.dot/brain/brain.py",
+  "launchagent_label": "com.dot.voicecall",
+  "lookup_words": [
+    "my ",
+    "rule",
+    "who ",
+    "who's",
+    "remember",
+    "decid",
+    "last time"
+  ],
+  "claude_keychain_item": "claude-oauth",
+  "claude_disabled_plugins": []
+}

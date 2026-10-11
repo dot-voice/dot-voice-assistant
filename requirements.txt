@@ -1,0 +1,4 @@
+websockets>=13
+mlx-whisper
+opencc-python-reimplemented
+webauthn
