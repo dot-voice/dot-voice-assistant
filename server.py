@@ -42,12 +42,60 @@ import realtime  # noqa: E402
 
 PORT = 8770
 AUTH_TIMEOUT_S = 20
+BUG_TIMEOUT_S = 60
 RESUME_TTL_S = 12 * 3600   # a reconnect token lasts one working day
 RESUME_MAX = 10
 PIN_FILE = os.path.join(HERE, "pin.txt")
 TURN_LOG = os.path.join(HERE, "logs", "turns.log")
 CALL_LOG_DIR = os.path.join(HERE, "logs", "calls")
 INDEX = os.path.join(HERE, "static", "index.html")
+
+
+def _cap_snapshot(snapshot):
+    if not isinstance(snapshot, dict):
+        return {}
+    snap = dict(snapshot)
+    if "lines" in snap and isinstance(snap["lines"], list):
+        capped_lines = []
+        for item in snap["lines"][-12:]:
+            if isinstance(item, dict):
+                d = dict(item)
+                if "text" in d and d["text"] is not None:
+                    d["text"] = str(d["text"])[:400]
+                capped_lines.append(d)
+            else:
+                capped_lines.append(item)
+        snap["lines"] = capped_lines
+    if "events" in snap and isinstance(snap["events"], list):
+        snap["events"] = list(snap["events"][-30:])
+    raw = json.dumps(snap, ensure_ascii=False)
+    if len(raw) > 20000:
+        while len(raw) > 20000 and snap.get("events"):
+            snap["events"] = snap["events"][1:]
+            raw = json.dumps(snap, ensure_ascii=False)
+        while len(raw) > 20000 and snap.get("lines"):
+            snap["lines"] = snap["lines"][1:]
+            raw = json.dumps(snap, ensure_ascii=False)
+        if len(raw) > 20000:
+            for k, v in list(snap.items()):
+                if isinstance(v, str) and len(v) > 200:
+                    snap[k] = v[:200]
+            raw = json.dumps(snap, ensure_ascii=False)
+        if len(raw) > 20000:
+            minimal = {k: snap[k] for k in ("version", "mode", "state") if k in snap}
+            snap = minimal
+    return snap
+
+
+def _last_turn_lines(path, n=40):
+    if not path or not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        return [ln.rstrip("\r\n") for ln in lines[-n:]]
+    except OSError:
+        return []
 
 
 def _noise_clip(seconds=1.0):
@@ -119,6 +167,8 @@ class LiveTools:
         self.call = call
 
     async def hand_off(self, words, agent):
+        if getattr(self.call, "bug", None):
+            return "not sent: this is a bug report, say only: noted"
         if getattr(self.call, "handoff_count", 0) >= 6:
             return "limit reached, tell the caller to use the menu"
         try:
@@ -167,6 +217,9 @@ class Call:
         self.posted_handoffs = []
         self.handoff_count = 0
         self.started_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.bug = None
+        self.bug_timer = None
+        self.svc.last_call = self   # tests reach the live Call through this
 
     def _on_live_closed(self):
         self.live = None
@@ -185,6 +238,14 @@ class Call:
             if item.get("type") == "live_error":
                 log_line("live: error %s" % str(item.get("text", ""))[:120], self.svc.turn_log)
                 self.live = None
+            elif item.get("type") == "live_heard":
+                words = str(item.get("text", "")).strip()
+                if self.bug and words:
+                    if self.live:
+                        await self.live.cancel()
+                    await self._record_bug_words(words)
+                    await self.send(item)
+                    return
             await self.send(item)
 
     async def send(self, obj):
@@ -254,6 +315,12 @@ class Call:
         if not text:
             await self.send({"type": "status", "state": "listening"})
             return
+        if self.bug:
+            await self.send({"type": "transcript", "role": "user", "text": text})
+            await self._record_bug_words(text)
+            return
+        if self.history and self.history[-1]["role"] == "user" and text.startswith(self.history[-1]["text"]):
+            self.history.pop()   # phone ears joined the interrupted first half with the rest: keep one line
         self.history.append({"role": "user", "text": text})
         await self.send({"type": "transcript", "role": "user", "text": text})
         asked = text
@@ -468,12 +535,19 @@ class Call:
                         await self.send({"type": "status", "state": "listening"})
                     elif kind == "text":
                         if self.live:
-                            pass
+                            if self.bug:
+                                said = str(data.get("text", "")).strip()[:600]
+                                if said:
+                                    await self._record_bug_words(said)
                         else:
                             said = str(data.get("text", "")).strip()[:600]
-                            if len(said) >= 2:
+                            min_len = 1 if self.bug else 2
+                            if len(said) >= min_len:
                                 await self.cancel_turn()
                                 self.task = asyncio.create_task(self._guarded_turn(None, said))
+                    elif kind == "bug":
+                        await self.cancel_turn()
+                        self.task = asyncio.create_task(self._on_bug(data.get("snapshot") or {}))
                     elif kind == "ears":
                         self.ears = "phone" if data.get("mode") == "phone" else "mac"
                     elif kind == "target":
@@ -503,7 +577,7 @@ class Call:
             if type(e).__name__ not in ("ConnectionClosedError", "ConnectionClosedOK", "ConnectionClosed"):
                 raise
         finally:
-            for t in (getattr(self, "keep", None), getattr(self, "upd", None)):
+            for t in (getattr(self, "keep", None), getattr(self, "upd", None), getattr(self, "bug_timer", None)):
                 if t:
                     t.cancel()
             await self.cancel_turn()
@@ -515,6 +589,92 @@ class Call:
                 self.live = None
                 log_line("live: off", self.svc.turn_log)
             self._write_call_summary()
+
+    async def _on_bug(self, snapshot):
+        try:
+            await self._on_bug_inner(snapshot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log_exception("bug report")
+
+    async def _on_bug_inner(self, snapshot):
+        if self.live and not getattr(self.live, "closed", False):
+            if getattr(self.live, "cancel", None):
+                await self.live.cancel()
+        if getattr(self, "bug_timer", None) and not self.bug_timer.done():
+            self.bug_timer.cancel()
+            self.bug_timer = None
+
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        server_lines = _last_turn_lines(getattr(self.svc, "turn_log", None), 40)
+        self.bug = {
+            "snapshot": _cap_snapshot(snapshot),
+            "server": server_lines,
+            "version": VERSION,
+            "created": stamp,
+        }
+        log_line("call: bug recorded", self.svc.turn_log)
+        self.bug_timer = asyncio.create_task(self._bug_timeout())   # before speaking: the prompt may be cancelled
+        await self.send({"type": "status_note", "text": "Bug recorded. What went wrong?"})
+        if self.live and not getattr(self.live, "closed", False):
+            await self.live.say_exact("Bug recorded. What went wrong?")
+        else:
+            await self.speak("Bug recorded. What went wrong?")
+
+    async def _bug_timeout(self):
+        try:
+            await asyncio.sleep(BUG_TIMEOUT_S)
+            if self.bug:
+                await self._record_bug_words("", speak_reply=False)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log_exception("bug_timeout")
+
+    async def _record_bug_words(self, words, speak_reply=True):
+        if getattr(self, "bug_timer", None) and not self.bug_timer.done():
+            self.bug_timer.cancel()
+            self.bug_timer = None
+        if not self.bug:
+            return
+        words = str(words or "").strip()
+        self.bug["words"] = words
+        stamp = self.bug.get("created") or time.strftime("%Y%m%d-%H%M%S")
+        doc = {
+            "to": "VOICE",
+            "task": "Bug report from the call",
+            "spoken": words,
+            "source": "voice_call_bug",
+            "bug": self.bug,
+        }
+        handoff_obj = getattr(self.svc, "handoff", None)
+        folder = getattr(handoff_obj, "folder", None) or os.path.join(HERE, "handoff")
+        try:
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, "%s-bug.json" % stamp)
+            n = 1
+            while os.path.exists(path):
+                n += 1
+                path = os.path.join(folder, "%s-bug-%d.json" % (stamp, n))
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(doc, f, indent=2)
+        except OSError:
+            log_exception("bug_report_write")
+            saved = False
+        else:
+            saved = True
+
+        self.posted_handoffs.append({"to": "VOICE", "words": words})
+
+        self.bug = None   # cleared before speaking: a second utterance meanwhile goes to the model, not a 2nd report
+        reply = "Thanks, sent to Voice." if saved else "Sorry, I could not save the bug report."
+        if speak_reply:
+            if self.live and not getattr(self.live, "closed", False):
+                await self.live.say_exact(reply)
+            else:
+                await self.send({"type": "transcript", "role": "assistant", "text": reply})
+                await self.speak(reply)
 
     def _write_call_summary(self):
         try:

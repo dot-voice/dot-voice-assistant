@@ -207,6 +207,19 @@ class LiveBridgeTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("limit reached", out[0]["item"]["output"])
         await self.b.close()
 
+    async def test_tool_done_while_she_talks_does_not_talk_over_her(self):
+        await self.make()
+        self.ws.push({"type": "conversation.item.input_audio_transcription.completed", "transcript": "any news"})
+        await self.settle()
+        self.b._in_turn = True   # she started a new sentence while the tool runs
+        self.ws.push({"type": "response.function_call_arguments.done", "name": "get_status", "call_id": "c_bt",
+                      "arguments": "{}"})
+        await self.settle()
+        out = [e for e in self.ws.sent if e.get("item", {}).get("type") == "function_call_output"]
+        self.assertEqual(out[0]["item"]["call_id"], "c_bt")
+        self.assertNotIn({"type": "response.create"}, self.ws.sent)
+        await self.b.close()
+
     async def test_tool_timeout_output_timed_out(self):
         await self.make()
         self.ws.push({"type": "response.function_call_arguments.done", "name": "get_status", "call_id": "c_to",

@@ -140,6 +140,26 @@ const LABELS = { listening:"Listening", thinking:"Thinking",
                  connecting:"Connecting", muted:"Muted" };
 
 // ---------------------------------------------------------------- state
+const APP_VER = "@@VERSION@@";
+let currentVersion = APP_VER;
+let lastSent = "";
+const clientEvents = [];
+function logEvent(type) {
+  clientEvents.push({ t: Date.now(), type: type });
+  if (clientEvents.length > 30) clientEvents.shift();
+}
+let chatLines = [];
+function getChatLines() {
+  if (chatLines.length) return chatLines.slice(-12);
+  const msgs = $("log") ? $("log").querySelectorAll(".msg:not(.live)") : [];
+  const out = [];
+  for (let i = 0; i < msgs.length; i++) {
+    const el = msgs[i];
+    const who = el.classList.contains("user") ? "user" : (el.classList.contains("assistant") ? "assistant" : "unknown");
+    out.push({ who: who, text: (el.textContent || "").trim() });
+  }
+  return out.slice(-12);
+}
 let ws = null, pin = "", ctx = null, stream = null, node = null, wakeLock = null;
 let inCall = false, muted = false, serverState = "connecting";
 let playing = false, dropAudio = false, ackPending = 0, genId = 0;
@@ -174,6 +194,7 @@ function load(k) { try { return localStorage.getItem(k) || ""; } catch (e) { ret
 try { liveMode = load("live") === "true"; } catch (e) { liveMode = false; }
 
 function setState(s) {
+  logEvent("state:" + s);
   serverState = s;
   render();
 }
@@ -186,7 +207,7 @@ function render() {
     // Ears stay off for the whole reply, not just while a sound part plays: Qwen leaves 1-2 s gaps between sentences, the
     // ears switched on in each gap, heard the assistant itself and iOS's audio-mode switch made the voice choppy
     //.
-    if (playing || s === "thinking" || serverState === "speaking" || serverState === "working") { lastPlayAt = Date.now(); stopRecog(); showLive(""); }
+    if (playing || serverState === "speaking" || serverState === "working") { lastPlayAt = Date.now(); stopRecog(); showLive(""); }
     else if (!recog && inCall) { if (Date.now() - lastPlayAt > 500) startRecog(); else setTimeout(render, 520); }
   }
   if (busy && !busySince) { busySince = Date.now(); busyTimer = setInterval(render, 250); }
@@ -196,6 +217,8 @@ function render() {
   $("orb").className = "face " + ((s === "muted") ? "" : s);
 }
 function addMsg(role, text) {
+  chatLines.push({ who: role, text: String(text || "") });
+  if (chatLines.length > 30) chatLines.shift();
   const d = document.createElement("div");
   d.className = "msg " + role; d.textContent = text;
   $("log").appendChild(d); $("log").scrollTop = $("log").scrollHeight;
@@ -219,20 +242,26 @@ function connect() {
     ws = new WebSocket(wsUrl());
     ws.binaryType = "arraybuffer";
     let settled = false;
-    ws.onopen = () => ws.send(JSON.stringify({ type: "auth", pin: pin, passkey: resumeToken ? null : faceCred,
-      resume: resumeToken || "", target: target, voice: phoneVoice ? "phone" : "mac", ears: earsPhone ? "phone" : "mac", standalone: !!navigator.standalone }));
+    ws.onopen = () => {
+      logEvent("ws_send:auth");
+      ws.send(JSON.stringify({ type: "auth", pin: pin, passkey: resumeToken ? null : faceCred,
+        resume: resumeToken || "", target: target, voice: phoneVoice ? "phone" : "mac", ears: earsPhone ? "phone" : "mac", standalone: !!navigator.standalone }));
+    };
     ws.onmessage = ev => {
-      if (typeof ev.data !== "string") { onAudio(ev.data); return; }
+      if (typeof ev.data !== "string") { logEvent("ws_recv:binary"); onAudio(ev.data); return; }
       const m = JSON.parse(ev.data);
+      logEvent("ws_recv:" + m.type + (m.state ? ":" + m.state : ""));
       if (m.type === "auth_ok") {
         settled = true; reconnectTries = 0; faceCred = null;
+        if (m.version) currentVersion = m.version;
         if (m.resume) resumeToken = m.resume;   // reconnects in this call: no PIN, no Face ID again
         if (m.targets) buildTargets(m.targets);
         else buildTargets(targets);
-        if (pin && window.PublicKeyCredential && m.passkeys === 0) ws.send(JSON.stringify({ type: "passkey_register_options" }));
+        if (pin && window.PublicKeyCredential && m.passkeys === 0) { logEvent("ws_send:passkey_register_options"); ws.send(JSON.stringify({ type: "passkey_register_options" })); }
         if (liveMode) {
           liveOk = false;
           setState("connecting");
+          logEvent("ws_send:live:on");
           ws.send(JSON.stringify({ type: "live", on: true }));
         }
         resolve();
@@ -260,6 +289,7 @@ function armLiveDrop() {
 function onMessage(m) {
   lastMsg = m.type + (m.state ? ':' + m.state : '');
   if (m.type === "status") {
+    if ((m.state === "speaking" || m.state === "working") && ackPending === 0) lastSent = "";
     if (m.state === "listening" && ackPending > 0) { ackPending--; dropAudio = ackPending > 0; }
     if (liveMode && !liveOk) {
       serverState = "connecting";
@@ -274,7 +304,7 @@ function onMessage(m) {
   else if (m.type === "voice_used") addChip("Qwen was slow, so the Mac voice spoke this time.", false);
   else if (m.type === "passkey_ok") { addChip("Face ID is on. Next time just tap Talk to Dot.", false); }
   else if (m.type === "passkey_fail") addChip("Face ID setup did not work. The PIN still works.", true);
-  else if (m.type === "error") addChip("Error: " + m.message, true);
+  else if (m.type === "error") { lastSent = ""; addChip("Error: " + m.message, true); }
   else if (m.type === "live_ok") {
     liveOk = true;
     setState("listening");
@@ -332,6 +362,7 @@ function splitPieces(text) {
 }
 function speakText(text) {
   if (dropAudio || !phoneVoice || !('speechSynthesis' in window)) return;
+  lastSent = "";
   const gen = genId;
   splitPieces(text).forEach(piece => {
     const u = new SpeechSynthesisUtterance(piece);
@@ -354,9 +385,11 @@ try { if (location.search.indexOf('debug') >= 0) document.body.classList.add('de
 // ---------------------------------------------------------------- phone ears (the iPhone's own speech recognition; the Mac does no listening)
 function sendText(t, waitedMs) {
   if (!ws || ws.readyState !== 1) return;
-  ws.send(JSON.stringify({ type: "text", text: t }));
+  const toSend = (lastSent ? lastSent + " " + t : t).trim();
+  lastSent = toSend;
+  logEvent("ws_send:text");
+  ws.send(JSON.stringify({ type: "text", text: toSend }));
   speechEndAt = performance.now() - (waitedMs || 0); metricSent = false;   // phone ears: the caller stopped about waitedMs ago
-  stopRecog();   // switch the ears off now, while it thinks: iOS changing audio mode as the reply started broke its first second
   setState("thinking");
 }
 function showLive(t) {
@@ -367,17 +400,25 @@ function showLive(t) {
 }
 function startRecog() {
   if (!SR || recog || !recogWant || !inCall && !starting) return;
+  logEvent("recog:start");
   const r = new SR();
   r.lang = recogLang; r.continuous = true; r.interimResults = true;
   r.onresult = ev => {
+    let hasNewFinal = false;
     for (let i = ev.resultIndex; i < ev.results.length; i++) {
       const res = ev.results[i];
-      if (res.isFinal) { const t = (res[0].transcript || "").trim(); if (t) heard = (heard + " " + t).trim(); }
+      if (res.isFinal) {
+        const t = (res[0].transcript || "").trim();
+        if (t) { heard = (heard + " " + t).trim(); hasNewFinal = true; }
+      }
     }
     let live = "";   // words appear while the caller is still talking (interim results), replaced by the real line when sent
     for (let i = 0; i < ev.results.length; i++) if (!ev.results[i].isFinal) live += ev.results[i][0].transcript || "";
     interim = live.trim();
     showLive((heard + " " + live).trim());
+    if (hasNewFinal && serverState === "thinking" && !playing) {
+      if (ackPending === 0) interrupt();
+    }
     // iOS ends a "final" result at any short pause, which cut sentences in half ("So tell the voice task to move the").
     // Send only after SEND_PAUSE_MS with no new words, joining the pieces.
     clearTimeout(heardTimer);
@@ -386,16 +427,19 @@ function startRecog() {
   };
   r.onerror = e => {
     lastMsg = "ears:" + e.error;
+    logEvent("recog:error:" + (e.error || ""));
     if (e.error === "not-allowed" || e.error === "service-not-allowed") {
       recogWant = false;
       addChip("Speech recognition is blocked. Allow Microphone and Speech Recognition for this site in Safari settings, or tap Ears to use the Mac.", true);
     }
   };
   r.onend = () => {
+    logEvent("recog:end");
     if (recog === r) recog = null;
     // iOS ends the session by itself (pauses, ~1 min) and throws away words not yet marked final: they were lost.
     if (interim) {
       heard = (heard + " " + interim).trim(); interim = "";
+      if (serverState === "thinking" && !playing && ackPending === 0) interrupt();
       clearTimeout(heardTimer);
       heardTimer = setTimeout(() => { const t = heard; heard = ""; if (t) { showLive(""); sendText(t, SEND_PAUSE_MS); } }, SEND_PAUSE_MS);
     }
@@ -404,6 +448,7 @@ function startRecog() {
   try { r.start(); recog = r; } catch (e) { recog = null; }
 }
 function stopRecog() {
+  logEvent("recog:stop");
   const r = recog; recog = null; interim = "";
   if (heard && !inCall) { heard = ""; clearTimeout(heardTimer); }
   if (r) { r.onend = null; r.onresult = null; try { r.abort(); } catch (e) {} }
@@ -496,6 +541,7 @@ function stopLivePlayback() {
 
 function onAudio(buf) {
   if (dropAudio || !ctx) return;
+  lastSent = "";
   const gen = genId;
   decodeChain = decodeChain.then(() => decode(buf.slice(0))).then(ab => {
     if (!ab || gen !== genId || dropAudio) return;
@@ -523,6 +569,7 @@ function decode(arrayBuffer) {
 function reportFirstSound(delayMs) {   // the real wait: end of the caller's speech -> first reply sound (logged as phone_e2e_ms)
   if (metricSent || !speechEndAt || !ws || ws.readyState !== 1) return;
   metricSent = true;
+  logEvent("ws_send:metric");
   ws.send(JSON.stringify({ type: "metric", e2e_ms: Math.round(performance.now() + (delayMs || 0) - speechEndAt) }));
 }
 function stopPlayback() {
@@ -538,6 +585,7 @@ function interrupt() {
   stopPlayback();
   if (liveMode) { stopLivePlayback(); armLiveDrop(); }
   dropAudio = true; ackPending++;
+  logEvent("ws_send:interrupt");
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "interrupt" }));
 }
 
@@ -729,6 +777,39 @@ async function acquireWakeLock() {
 }
 document.addEventListener("visibilitychange", () => { if (inCall && document.visibilityState === "visible") acquireWakeLock(); });
 
+// ---------------------------------------------------------------- bug report: shake the phone (or menu > Report a bug)
+let lastBugAt = 0, shakeHits = [], lastAcc = null, motionOn = false;
+function reportBug(how) {
+  if (!inCall || !ws || ws.readyState !== 1 || Date.now() - lastBugAt < 10000) return;
+  lastBugAt = Date.now();
+  lastSent = ""; stopPlayback(); if (liveMode) stopLivePlayback();
+  try { navigator.vibrate && navigator.vibrate(200); } catch (e) {}
+  addChip("Bug recorded - say what went wrong", false);
+  logEvent("bug:" + how);
+  ws.send(JSON.stringify({ type: "bug", snapshot: { version: currentVersion, mode: liveMode ? "live" : (earsPhone ? "phone" : "mac"),
+    state: serverState, playing: playing, muted: muted, lines: getChatLines(), events: clientEvents.slice(-30), ua: navigator.userAgent } }));
+}
+function onMotion(ev) {
+  const a = ev.accelerationIncludingGravity;
+  if (!a || a.x == null) return;
+  if (lastAcc) {
+    const d = Math.abs(a.x - lastAcc.x) + Math.abs(a.y - lastAcc.y) + Math.abs(a.z - lastAcc.z);
+    const now = Date.now();
+    if (d > 25) {
+      shakeHits = shakeHits.filter(t => now - t < 800); shakeHits.push(now);
+      if (shakeHits.length >= 3) { shakeHits = []; reportBug("shake"); }
+    }
+  }
+  lastAcc = { x: a.x, y: a.y, z: a.z };
+}
+function armShake() {   // called inside the call-start tap: iOS asks for motion permission only from a user gesture
+  if (motionOn || !window.DeviceMotionEvent) return;
+  const on = () => { if (!motionOn) { motionOn = true; window.addEventListener("devicemotion", onMotion); } };
+  if (typeof DeviceMotionEvent.requestPermission === "function") {
+    DeviceMotionEvent.requestPermission().then(r => { if (r === "granted") on(); }).catch(() => {});
+  } else on();
+}
+
 async function startCall() {
   pin = $("pin").value.trim();
   // Face ID first, while the tap is fresh, before the speech and microphone prompts
@@ -738,6 +819,8 @@ async function startCall() {
     const o = faceOpts; faceOpts = null;
     faceP = navigator.credentials.get({ publicKey: getOptions(o) });
   }
+  if (faceP) document.addEventListener("click", armShake, { once: true });   // never stack the motion prompt on Face ID
+  else armShake();
   phoneVoice = false; unlockSpeech();   // Qwen voice locked; the Voice button is gone
   earsPhone = !!SR && load('ears') !== 'mac'; recogLang = load('lang') === 'zh-CN' ? 'zh-CN' : 'en-US';
   liveMode = load('live') === 'true';
@@ -894,7 +977,7 @@ $("langBtn").onclick = () => {
   if (recog) { stopRecog(); }   // render restarts it with the new language
   render();
 };
-$("stopTalk").onclick = () => { if (inCall) interrupt(); };
+$("stopTalk").onclick = () => { if (inCall) { lastSent = ""; interrupt(); } };   // Skip drops the words too
 const LOOKS = ["/dot/dot-real.jpg", "/dot/dot-cartoon.jpg"];
 function faceImg(img, src) {
   if (!img) return;
@@ -940,6 +1023,13 @@ function buildTargets(list) {
       window.open("/board?t=" + encodeURIComponent(resumeToken), "_blank", "noopener,noreferrer");
     };
     box.appendChild(b);
+  }
+  if (inCall) {
+    const bb = document.createElement("button");
+    bb.type = "button";
+    bb.textContent = "Report a bug";
+    bb.onclick = () => { $("toMenu").classList.add("hidden"); reportBug("menu"); };
+    box.appendChild(bb);
   }
 }
 $("toBtn").onclick = () => { buildTargets(targets); $("toMenu").classList.remove("hidden"); };

@@ -375,6 +375,10 @@ class LiveBridge:
 
             await self._send({"type": "conversation.item.create",
                               "item": {"type": "function_call_output", "call_id": call_id, "output": str(out)}})
+            if self._in_turn:
+                # She is talking while the tool finished: do not talk over her. The result is in the
+                # conversation; server VAD answers when she stops, with the result in context.
+                return
             await self._send({"type": "response.create"})
             self.response_active = True
         except asyncio.CancelledError:

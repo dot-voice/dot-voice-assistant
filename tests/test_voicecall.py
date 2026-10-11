@@ -820,3 +820,162 @@ class TestDirectStatus(unittest.TestCase):
         self.assertEqual(status.named_session("how is the website"), "WEBSITE")
         out = status.direct_status("what is going on", folder=d, titles={})
         self.assertEqual(out, "Latest from your sessions, in their own words. CRM, just now: Fix the six key notes.")
+
+
+class TestBugReport(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="voicecall-bugtest-")
+        self.handoff_dir = os.path.join(self.tmp, "handoff")
+        self.turn_log = os.path.join(self.tmp, "turns.log")
+        with open(self.turn_log, "w", encoding="utf-8") as f:
+            for i in range(50):
+                f.write("2026-10-11 12:00:%02d stt_ms=%d\n" % (i % 60, i * 10))
+        self.svc = server.Services(
+            stt.FakeSpeechToText("words from mic"),
+            frontdesk.FakeFrontDesk(),
+            tts.FakeTextToSpeech(),
+            handoff.FileHandoff(folder=self.handoff_dir, post=False),
+            auth.PinGuard("123456"),
+            turn_log=self.turn_log,
+        )
+        self.srv = await server.serve(self.svc, "127.0.0.1", 0)
+        self.port = self.srv.sockets[0].getsockname()[1]
+        self._orig_timeout = server.BUG_TIMEOUT_S
+
+    async def asyncTearDown(self):
+        server.BUG_TIMEOUT_S = self._orig_timeout
+        self.srv.close()
+        await self.srv.wait_closed()
+
+    async def client(self):
+        from websockets.asyncio.client import connect
+        ws = await connect("ws://127.0.0.1:%d" % self.port)
+        await ws.send(json.dumps({"type": "auth", "pin": "123456"}))
+        auth_msg = json.loads(await asyncio.wait_for(ws.recv(), 5))
+        self.assertEqual(auth_msg["type"], "auth_ok")
+        st = json.loads(await asyncio.wait_for(ws.recv(), 5))
+        self.assertEqual(st.get("state"), "listening")
+        return ws
+
+    async def drain_until_type(self, ws, target_type):
+        for _ in range(30):
+            m = await asyncio.wait_for(ws.recv(), 5)
+            if isinstance(m, bytes):
+                continue
+            d = json.loads(m)
+            if d.get("type") == target_type:
+                return d
+        return None
+
+    def test_cap_snapshot_direct(self):
+        snap = {
+            "version": "1.0",
+            "lines": [{"who": "user", "text": "a" * 600} for _ in range(25)],
+            "events": list(range(50)),
+            "ua": "test-browser",
+        }
+        capped = server._cap_snapshot(snap)
+        self.assertEqual(len(capped["lines"]), 12)
+        for line in capped["lines"]:
+            self.assertLessEqual(len(line["text"]), 400)
+        self.assertEqual(len(capped["events"]), 30)
+        self.assertLessEqual(len(json.dumps(capped, ensure_ascii=False)), 20000)
+
+    async def test_bug_message_stores_snapshot_capped(self):
+        ws = await self.client()
+        snap = {
+            "version": "2.0",
+            "lines": [{"who": "user", "text": "x" * 500} for _ in range(20)],
+            "events": [{"e": i} for i in range(40)],
+            "ua": "phone",
+        }
+        await ws.send(json.dumps({"type": "bug", "snapshot": snap}))
+        note = await self.drain_until_type(ws, "status_note")
+        self.assertIsNotNone(note)
+        self.assertEqual(note.get("text"), "Bug recorded. What went wrong?")
+        await self.drain_until_type(ws, "audio_end")
+        call = getattr(self.svc, "last_call", None)
+        self.assertIsNotNone(call)
+        self.assertIsNotNone(call.bug)
+        self.assertEqual(len(call.bug["snapshot"]["lines"]), 12)
+        for line in call.bug["snapshot"]["lines"]:
+            self.assertLessEqual(len(line["text"]), 400)
+        self.assertEqual(len(call.bug["snapshot"]["events"]), 30)
+        self.assertLessEqual(len(json.dumps(call.bug["snapshot"])), 20000)
+        self.assertEqual(len(call.bug["server"]), 40)
+        self.assertEqual(call.bug["version"], server.VERSION)
+        self.assertTrue(call.bug["created"])
+        log_text = open(self.turn_log).read()
+        self.assertIn("call: bug recorded", log_text)
+        await ws.close()
+
+    async def test_next_text_becomes_bug_words_not_sent_to_frontdesk(self):
+        ws = await self.client()
+        snap = {"version": "1.0", "lines": [{"who": "user", "text": "bad"}], "events": []}
+        await ws.send(json.dumps({"type": "bug", "snapshot": snap}))
+        note = await self.drain_until_type(ws, "status_note")
+        self.assertEqual(note.get("text"), "Bug recorded. What went wrong?")
+        await self.drain_until_type(ws, "audio_end")
+        call = getattr(self.svc, "last_call", None)
+        self.assertIsNotNone(call.bug)
+
+        await ws.send(json.dumps({"type": "text", "text": "The voice sounds robotic and stalls"}))
+        await self.drain_until_type(ws, "audio_end")
+
+        self.assertEqual(self.svc.frontdesk.seen, [])
+        self.assertIsNone(call.bug)
+
+        files = [f for f in os.listdir(self.handoff_dir) if f.endswith("-bug.json")]
+        self.assertEqual(len(files), 1)
+        data = json.load(open(os.path.join(self.handoff_dir, files[0])))
+        self.assertEqual(data["to"], "VOICE")
+        self.assertEqual(data["task"], "Bug report from the call")
+        self.assertEqual(data["spoken"], "The voice sounds robotic and stalls")
+        self.assertEqual(data["source"], "voice_call_bug")
+        self.assertEqual(data["bug"]["words"], "The voice sounds robotic and stalls")
+        self.assertEqual(len(data["bug"]["server"]), 40)
+        self.assertEqual(data["bug"]["version"], server.VERSION)
+        await ws.close()
+
+    async def test_timeout_path_writes_with_empty_words(self):
+        server.BUG_TIMEOUT_S = 0.05
+        ws = await self.client()
+        snap = {"version": "1.0", "lines": [], "events": []}
+        await ws.send(json.dumps({"type": "bug", "snapshot": snap}))
+        note = await self.drain_until_type(ws, "status_note")
+        self.assertEqual(note.get("text"), "Bug recorded. What went wrong?")
+        await self.drain_until_type(ws, "audio_end")
+        call = getattr(self.svc, "last_call", None)
+        self.assertIsNotNone(call.bug)
+
+        await asyncio.sleep(0.12)
+        self.assertIsNone(call.bug)
+
+        files = [f for f in os.listdir(self.handoff_dir) if f.endswith("-bug.json")]
+        self.assertEqual(len(files), 1)
+        data = json.load(open(os.path.join(self.handoff_dir, files[0])))
+        self.assertEqual(data["to"], "VOICE")
+        self.assertEqual(data["task"], "Bug report from the call")
+        self.assertEqual(data["spoken"], "")
+        self.assertEqual(data["source"], "voice_call_bug")
+        self.assertEqual(data["bug"]["words"], "")
+        await ws.close()
+
+    async def test_audio_utterance_becomes_bug_words(self):
+        ws = await self.client()
+        snap = {"version": "1.0", "lines": [], "events": []}
+        await ws.send(json.dumps({"type": "bug", "snapshot": snap}))
+        await self.drain_until_type(ws, "status_note")
+        await self.drain_until_type(ws, "audio_end")   # the spoken "Bug recorded" prompt
+
+        await ws.send(server.fake_clip(1.0))
+        await self.drain_until_type(ws, "audio_end")   # the spoken "Thanks, sent to Voice."
+
+        self.assertEqual(self.svc.frontdesk.seen, [])
+        files = [f for f in os.listdir(self.handoff_dir) if f.endswith("-bug.json")]
+        self.assertEqual(len(files), 1)
+        data = json.load(open(os.path.join(self.handoff_dir, files[0])))
+        self.assertEqual(data["to"], "VOICE")
+        self.assertEqual(data["spoken"], "words from mic")
+        self.assertEqual(data["bug"]["words"], "words from mic")
+        await ws.close()
