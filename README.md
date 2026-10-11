@@ -12,6 +12,8 @@ agents without opening a laptop.
 - Real work is handed over with **your exact words**, never a summary.
 - Status answers are read **word for word** from what the agents themselves saved. Dot does not guess or retell.
 - A menu at the top picks which agent your requests go to (or "Auto": Dot routes by what you say).
+- **Live mode** (optional): speech-to-speech with Qwen-Omni realtime, about 1.5 s to first sound, and you can talk
+  over Dot to interrupt.
 - Sign in once with a PIN, then with Face ID (passkeys).
 - Runs on your own Mac. Nothing is exposed to the internet: the phone reaches it over Tailscale.
 
@@ -30,8 +32,8 @@ server.py  (WebSocket + small HTTP, 127.0.0.1:8770, published to your tailnet wi
   `- auth.py / passkey.py   PIN with lockout, Face ID (WebAuthn passkey), reconnect tokens
 ```
 
-Measured on an Apple-silicon Mac with Qwen's Beijing endpoint: first sound 2-5 s after you stop
-talking. Lower latency is the next goal.
+Measured on an Apple-silicon Mac with Qwen's Beijing endpoint: first sound 5-7 s after you stop talking in the
+classic mode, about 1.5 s (2 s when a tool runs) in Live mode. Lower latency is the next goal.
 
 ## Requirements
 
@@ -110,6 +112,20 @@ voice is slow. `local_config.json`, `pin.txt`, `passkeys.json`, `logs/` and `han
 
 Put two square pictures at `static/dot/dot-real.jpg` and `static/dot/dot-cartoon.jpg` (tap the face in the call to
 switch between them). Without them the page shows a plain animated ring. Use pictures you have the rights to.
+
+## Live mode
+
+Tap **Live** in the call. The phone streams 16 kHz audio to the Mac, which relays it to Qwen-Omni realtime
+(`qwen3.5-omni-flash-realtime` by default; `live_model` and `live_voice` in the config change it). Dot answers in
+streamed speech and stops the moment you start talking.
+
+- Your audio goes to Alibaba Cloud while Live is on (the classic mode sends text only). Live is off by default.
+- Real work still goes through `hand_off` with **your exact words**: the Mac transcribes the turn's audio locally
+  with Whisper, because the realtime model may not return a transcript on tool turns. No words, no hand-off.
+- Status answers are read word for word (`get_status`); weather, time and notes come from `lookup`.
+- Limits per call: 6 hand-offs, 20 s per tool. When a call ends, posted hand-offs are listed in
+  `handoff/<timestamp>-call-summary.json`.
+- If Live fails, the page says "Live off" and falls back to the classic mode without dropping the call.
 
 ## Choosing the chat model
 

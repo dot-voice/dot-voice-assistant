@@ -38,6 +38,7 @@ DEFAULTS = {
     "team_jobs_dir": "~/.dot/team/jobs",
     "rp_id": "localhost",
     "updates_dir": "~/.dot/updates",
+    "board_file": "~/.dot/board.html",
     "brain_tool": "~/.dot/brain/brain.py",
     "launchagent_label": "com.dot.voicecall",
 }

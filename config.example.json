@@ -115,5 +115,6 @@
     "last time"
   ],
   "claude_keychain_item": "claude-oauth",
-  "claude_disabled_plugins": []
+  "claude_disabled_plugins": [],
+  "board_file": "~/.dot/board.html"
 }

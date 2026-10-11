@@ -98,7 +98,7 @@
 <!-- A real form with username + current-password lets iOS save the PIN in iCloud Keychain and fill it with Face ID.
     The server still checks the PIN; nothing about auth changed. -->
 <form id="login" action="#" method="post" autocomplete="on">
-  <div class="face big" id="loginFace"><img src="/dot/dot-real.jpg" alt="Dot"></div>
+  <div class="face big" id="loginFace"><img src="/dot/dot-real.jpg" alt="Dot" onerror="this.classList.add('gone');if(this.parentNode)this.parentNode.classList.add('noimg');"></div>
   <p>Hi @@OWNER@@, it's @@ASSISTANT@@. Enter your PIN to talk.</p>
   <input id="user" name="username" type="text" autocomplete="username" value="@@USER@@" readonly style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0" tabindex="-1" aria-hidden="true">
   <input id="pin" name="password" type="password" inputmode="numeric" autocomplete="current-password" maxlength="12" placeholder="&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;">
@@ -107,7 +107,7 @@
 </form>
 
 <section id="call" class="hidden">
-  <div id="top"><div class="face" id="orb" title="Tap to change Dot's look"><img id="dotImg" src="/dot/dot-real.jpg" alt="Dot"></div>
+  <div id="top"><div class="face" id="orb" title="Tap to change Dot's look"><img id="dotImg" src="/dot/dot-real.jpg" alt="Dot" onerror="this.classList.add('gone');if(this.parentNode)this.parentNode.classList.add('noimg');"></div>
     <div id="who"><div id="name">Dot</div><div id="state"></div></div>
     <button id="toBtn" type="button" aria-label="Choose who you talk to">&#9776; <span id="toLbl">Auto</span></button></div>
   <div id="toMenu" class="hidden"><div id="toList"></div></div>
@@ -117,6 +117,7 @@
     <div id="controls">
       <button class="ctl" id="mute"><span class="ico">&#127908;</span><span class="lbl">Mute</span></button>
       <button class="ctl" id="stopTalk"><span class="ico">&#9197;</span><span class="lbl">Skip</span></button>
+      <button class="ctl" id="liveBtn"><span class="ico">&#9889;</span><span class="lbl">Live</span></button>
       <button class="ctl" id="earsBtn"><span class="ico">&#128066;</span><span class="lbl">Phone</span></button>
       <button class="ctl" id="langBtn"><span class="ico">&#127760;</span><span class="lbl">EN</span></button>
       <button class="ctl danger" id="end"><span class="ico">&#9742;</span><span class="lbl">End</span></button>
@@ -156,9 +157,21 @@ let heard = "", heardTimer = null, interim = "";
 let noiseFloor = 0.01, quietMs = 0, inSpeech = false, speechMs = 0, silenceMs = 0, loudMs = 0;
 let utter = [], preroll = [], prerollSamples = 0, utterSamples = 0;
 
+// Live mode
+let liveMode = false;
+let liveSources = [], liveNextTime = 0;
+let liveAcc = [], liveAccLen = 0;
+const LIVE_CHUNK_SAMPLES = 960;   // ~60 ms at 16 kHz
+let workletBlobUrl = null;
+let liveOk = false;
+let liveDropAudio = false, liveSilenceTimer = null;
+let micSrc = null, keepAliveSrc = null;
+let tapToListen = false, modeRunningBeforeLive = null;
+
 const $ = id => document.getElementById(id);
 function store(k, v) { try { if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v); } catch (e) {} }
 function load(k) { try { return localStorage.getItem(k) || ""; } catch (e) { return ""; } }
+try { liveMode = load("live") === "true"; } catch (e) { liveMode = false; }
 
 function setState(s) {
   serverState = s;
@@ -187,9 +200,13 @@ function addMsg(role, text) {
   d.className = "msg " + role; d.textContent = text;
   $("log").appendChild(d); $("log").scrollTop = $("log").scrollHeight;
 }
-function addChip(text, err) {
+function addChip(text, err, onClick) {
   const d = document.createElement("div");
   d.className = "chip" + (err ? " err" : ""); d.textContent = text;
+  if (onClick) {
+    d.style.cursor = "pointer";
+    d.onclick = onClick;
+  }
   $("log").appendChild(d); $("log").scrollTop = $("log").scrollHeight;
 }
 
@@ -208,10 +225,16 @@ function connect() {
       if (typeof ev.data !== "string") { onAudio(ev.data); return; }
       const m = JSON.parse(ev.data);
       if (m.type === "auth_ok") {
-        if (m.targets) buildTargets(m.targets);
         settled = true; reconnectTries = 0; faceCred = null;
         if (m.resume) resumeToken = m.resume;   // reconnects in this call: no PIN, no Face ID again
+        if (m.targets) buildTargets(m.targets);
+        else buildTargets(targets);
         if (pin && window.PublicKeyCredential && m.passkeys === 0) ws.send(JSON.stringify({ type: "passkey_register_options" }));
+        if (liveMode) {
+          liveOk = false;
+          setState("connecting");
+          ws.send(JSON.stringify({ type: "live", on: true }));
+        }
         resolve();
       }
       else if (m.type === "auth_fail" || m.type === "auth_retry") { settled = true; reject(m); }
@@ -222,11 +245,28 @@ function connect() {
   });
 }
 
+function handleLiveError(t) {
+  addChip("Live off: " + (t || "error"), true);
+  liveOk = false;
+  setLive(false);
+}
+
+function armLiveDrop() {
+  liveDropAudio = true;
+  clearTimeout(liveSilenceTimer);
+  liveSilenceTimer = setTimeout(() => { liveDropAudio = false; }, 300);
+}
+
 function onMessage(m) {
   lastMsg = m.type + (m.state ? ':' + m.state : '');
   if (m.type === "status") {
     if (m.state === "listening" && ackPending > 0) { ackPending--; dropAudio = ackPending > 0; }
-    setState(m.state);
+    if (liveMode && !liveOk) {
+      serverState = "connecting";
+      render();
+    } else {
+      setState(m.state);
+    }
   } else if (m.type === "transcript") addMsg(m.role, m.text);
   else if (m.type === "handoff") addChip("Handed to " + (m.to || "a session") + ": " + m.text, false);
   else if (m.type === "say") speakText(m.text);
@@ -235,10 +275,39 @@ function onMessage(m) {
   else if (m.type === "passkey_ok") { addChip("Face ID is on. Next time just tap Talk to Dot.", false); }
   else if (m.type === "passkey_fail") addChip("Face ID setup did not work. The PIN still works.", true);
   else if (m.type === "error") addChip("Error: " + m.message, true);
+  else if (m.type === "live_ok") {
+    liveOk = true;
+    setState("listening");
+  }
+  else if (m.type === "live_audio") {
+    if (liveDropAudio) {
+      clearTimeout(liveSilenceTimer);
+      liveSilenceTimer = setTimeout(() => { liveDropAudio = false; }, 300);
+      return;
+    }
+    playLiveAudioChunk(m.b64);
+  }
+  else if (m.type === "live_stop") {
+    stopLivePlayback();
+    armLiveDrop();
+  }
+  else if (m.type === "live_heard") { if (m.text) addMsg("user", m.text); }
+  else if (m.type === "live_said") {
+    clearTimeout(liveSilenceTimer);
+    liveDropAudio = false;
+    if (m.text) addMsg("assistant", m.text);
+  }
+  else if (m.type === "live_error") {
+    handleLiveError(m.text);
+  }
 }
 
 async function onDrop() {
   if (!inCall) return;
+  liveOk = false;
+  clearTimeout(liveSilenceTimer);
+  liveDropAudio = false;
+  stopLivePlayback();
   addChip("Connection lost", true);
   while (inCall && reconnectTries < 6) {
     reconnectTries++;
@@ -339,31 +408,92 @@ function stopRecog() {
   if (heard && !inCall) { heard = ""; clearTimeout(heardTimer); }
   if (r) { r.onend = null; r.onresult = null; try { r.abort(); } catch (e) {} }
 }
+function setLiveButton() {
+  const b = $("liveBtn");
+  if (b) b.classList.toggle("on", liveMode);
+}
 function setEarsButton() {
   $("earsBtn").querySelector(".lbl").textContent = earsPhone ? "Phone" : "Mac";
   $("langBtn").querySelector(".lbl").textContent = recogLang === "zh-CN" ? "ZH" : "EN";
-  $("langBtn").style.display = earsPhone ? "" : "none";
+  $("langBtn").style.display = (!liveMode && earsPhone) ? "" : "none";
+}
+function getAudioCtx() {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!ctx || ctx.state === "closed") ctx = new AC();
+  return ctx;
 }
 async function startAudioOnly() {
-  const AC = window.AudioContext || window.webkitAudioContext;
-  ctx = new AC();
-  if (ctx.state === "suspended") await ctx.resume();
+  const c = getAudioCtx();
+  if (c.state === "suspended") await c.resume();
   keepOutputAlive();
 }
 // A faint constant signal keeps the audio route awake, so the first second of a reply is not ducked or ramped up by the phone.
 function keepOutputAlive() {
   try {
-    if (!ctx) return;
-    const b = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
+    const c = getAudioCtx();
+    if (!c) return;
+    if (keepAliveSrc && keepAliveSrc.ctx === c) return;   // one looping source per AudioContext
+    const b = c.createBuffer(1, c.sampleRate, c.sampleRate);
     const d = b.getChannelData(0);
     for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * 0.00002;
-    const s = ctx.createBufferSource(); s.buffer = b; s.loop = true;
-    const g = ctx.createGain(); g.gain.value = 1;
-    s.connect(g); g.connect(ctx.destination); s.start();
+    const s = c.createBufferSource(); s.buffer = b; s.loop = true;
+    const g = c.createGain(); g.gain.value = 1;
+    s.connect(g); g.connect(c.destination); s.start();
+    keepAliveSrc = { ctx: c, src: s };
   } catch (e) {}
 }
 
 // ---------------------------------------------------------------- playback
+function playLiveAudioChunk(b64) {
+  if (!b64 || !inCall) return;
+  const c = getAudioCtx();
+  if (!c) return;
+  if (c.state === "suspended") c.resume().catch(() => {});
+  try {
+    const raw = atob(b64);
+    const len = raw.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = raw.charCodeAt(i);
+    const int16 = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(len / 2));
+    if (!int16.length) return;
+    const buf = c.createBuffer(1, int16.length, 24000);
+    const ch = buf.getChannelData(0);
+    for (let i = 0; i < int16.length; i++) ch[i] = int16[i] / 32768.0;
+
+    const src = c.createBufferSource();
+    src.buffer = buf;
+    src.connect(c.destination);
+
+    const now = c.currentTime;
+    const startAt = Math.max(now, liveNextTime);
+    src.start(startAt);
+    liveNextTime = startAt + buf.duration;
+    liveSources.push(src);
+    playing = true;
+    render();
+
+    src.onended = () => {
+      liveSources = liveSources.filter(s => s !== src);
+      if (!liveSources.length) {
+        playing = false;
+        loudMs = 0;
+        render();
+      }
+    };
+  } catch (e) {}
+}
+
+function stopLivePlayback() {
+  liveSources.forEach(s => {
+    try { s.onended = null; s.stop(); } catch (e) {}
+  });
+  liveSources = [];
+  liveNextTime = 0;
+  playing = false;
+  loudMs = 0;
+  render();
+}
+
 function onAudio(buf) {
   if (dropAudio || !ctx) return;
   const gen = genId;
@@ -400,10 +530,13 @@ function stopPlayback() {
   sources.forEach(s => { try { s.onended = null; s.stop(); } catch (e) {} });
   sources = []; nextTime = 0; playing = false;
   try { if ('speechSynthesis' in window) speechSynthesis.cancel(); } catch (e) {}
-  speakCount = 0; render();
+  speakCount = 0;
+  stopLivePlayback();
+  render();
 }
 function interrupt() {
   stopPlayback();
+  if (liveMode) { stopLivePlayback(); armLiveDrop(); }
   dropAudio = true; ackPending++;
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "interrupt" }));
 }
@@ -415,25 +548,117 @@ class Tap extends AudioWorkletProcessor {
 }
 registerProcessor("tap", Tap);`;
 
-async function startMic() {
-  // Ask for the microphone once per page load and keep it: iPhone Safari asks again on every new request, so ending a call
-  // only switches the tracks off (enabled=false) and the next call reuses the same permission.
+async function getMicStream() {
   const live = keptStream && keptStream.getAudioTracks().some(t => t.readyState === "live");
   if (!live) keptStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
   keptStream.getAudioTracks().forEach(t => { t.enabled = true; });
   stream = keptStream;
-  const AC = window.AudioContext || window.webkitAudioContext;
-  ctx = new AC();
-  if (ctx.state === "suspended") await ctx.resume();
-  const url = URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" }));
-  await ctx.audioWorklet.addModule(url);
-  const src = ctx.createMediaStreamSource(stream);
-  node = new AudioWorkletNode(ctx, "tap");
-  node.port.onmessage = e => onFrame(e.data);
+  return stream;
+}
+
+async function setupMicCapture() {
+  if (node) return;
+  const s = await getMicStream();
+  const c = getAudioCtx();
+  if (c.state === "suspended") await c.resume();
+  const src = c.createMediaStreamSource(s);
+
+  let captureNode = null;
+  if (c.audioWorklet && window.AudioWorkletNode) {
+    try {
+      if (!workletBlobUrl) {
+        workletBlobUrl = URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" }));
+      }
+      await c.audioWorklet.addModule(workletBlobUrl);
+      captureNode = new AudioWorkletNode(c, "tap");
+      captureNode.port.onmessage = e => onMicData(e.data);
+    } catch (e) {
+      captureNode = null;
+    }
+  }
+
+  if (!captureNode && c.createScriptProcessor) {
+    try {
+      const sp = c.createScriptProcessor(2048, 1, 1);
+      sp.onaudioprocess = e => {
+        const data = e.inputBuffer.getChannelData(0);
+        onMicData(data.slice(0));
+      };
+      captureNode = sp;
+    } catch (e) {
+      captureNode = null;
+    }
+  }
+
+  if (!captureNode) {
+    throw new Error("Microphone capture unavailable");
+  }
+
+  node = captureNode;
   src.connect(node);
+  const mute = c.createGain();
+  mute.gain.value = 0;
+  node.connect(mute);
+  mute.connect(c.destination);
   keepOutputAlive();
-  const mute = ctx.createGain(); mute.gain.value = 0;   // keep the graph running without echoing the mic
-  node.connect(mute); mute.connect(ctx.destination);
+}
+
+async function startMic() {
+  await setupMicCapture();
+}
+
+function onMicData(raw) {
+  if (liveMode) {
+    onLiveFrame(raw);
+  } else {
+    onFrame(raw);
+  }
+}
+
+function onLiveFrame(raw) {
+  if (!inCall || !ws || ws.readyState !== 1) {
+    liveAcc = []; liveAccLen = 0;
+    return;
+  }
+  const level = rms(raw);
+  if (!playing) {
+    const o = $("orb");
+    if (o) o.style.transform = "scale(" + (1 + Math.min(0.35, level * 4)).toFixed(3) + ")";
+  }
+  if (muted) {
+    liveAcc = []; liveAccLen = 0;
+    return;
+  }
+  const f32 = downsample(raw, ctx.sampleRate);
+  liveAcc.push(f32);
+  liveAccLen += f32.length;
+  while (liveAccLen >= LIVE_CHUNK_SAMPLES) {
+    const out = new Int16Array(LIVE_CHUNK_SAMPLES);
+    let written = 0;
+    while (written < LIVE_CHUNK_SAMPLES) {
+      const first = liveAcc[0];
+      const need = LIVE_CHUNK_SAMPLES - written;
+      if (first.length <= need) {
+        for (let i = 0; i < first.length; i++) {
+          const s = Math.max(-1, Math.min(1, first[i]));
+          out[written + i] = s < 0 ? s * 32768 : s * 32767;
+        }
+        written += first.length;
+        liveAcc.shift();
+      } else {
+        for (let i = 0; i < need; i++) {
+          const s = Math.max(-1, Math.min(1, first[i]));
+          out[written + i] = s < 0 ? s * 32768 : s * 32767;
+        }
+        liveAcc[0] = first.subarray(need);
+        written += need;
+      }
+    }
+    liveAccLen -= LIVE_CHUNK_SAMPLES;
+    if (ws && ws.readyState === 1 && !muted) {
+      ws.send(out.buffer);
+    }
+  }
 }
 
 function downsample(f32, inRate) {
@@ -514,13 +739,16 @@ async function startCall() {
     faceP = navigator.credentials.get({ publicKey: getOptions(o) });
   }
   phoneVoice = false; unlockSpeech();   // Qwen voice locked; the Voice button is gone
-  earsPhone = !!SR && load('ears') !== 'mac'; recogLang = load('lang') === 'zh-CN' ? 'zh-CN' : 'en-US'; setEarsButton();
-  recogWant = earsPhone; starting = true; if (earsPhone) startRecog();   // must start inside the tap so iOS asks for permission
+  earsPhone = !!SR && load('ears') !== 'mac'; recogLang = load('lang') === 'zh-CN' ? 'zh-CN' : 'en-US';
+  liveMode = load('live') === 'true';
+  setLiveButton(); setEarsButton();
+  recogWant = !liveMode && earsPhone; starting = true;
+  if (recogWant) startRecog();   // must start inside the tap so iOS asks for permission
   if (!pin && !faceP) { $("loginMsg").textContent = "PIN?"; return; }
   $("start").disabled = true; $("loginMsg").textContent = "";
   try { if (navigator.audioSession) navigator.audioSession.type = "play-and-record"; } catch (e) {}   // iPhone: play even with the silent switch on
   try {
-    if (earsPhone) await startAudioOnly(); else await startMic();   // must run inside the tap so iOS allows audio
+    if (!liveMode && earsPhone) await startAudioOnly(); else await startMic();   // must run inside the tap so iOS allows audio
     if (faceP) { try { faceCred = credJSON(await faceP); } catch (e) { prefetchFaceOpts(); throw { type: "face" }; } }
     await connect();
   } catch (e) {
@@ -541,7 +769,8 @@ async function startCall() {
 }
 
 function stopEverything() {
-  inCall = false; recogWant = false; stopRecog(); stopPlayback();
+  inCall = false; recogWant = false; stopRecog(); stopPlayback(); stopLivePlayback();
+  liveAcc = []; liveAccLen = 0;
   try { if (ws) { ws.onclose = null; ws.close(); } } catch (e) {}
   try { if (node) node.disconnect(); } catch (e) {}
   try { if (stream) stream.getTracks().forEach(t => { t.enabled = false; }); } catch (e) {}   // keep the permission; the mic is silent between calls
@@ -553,7 +782,9 @@ function stopEverything() {
 function endCall() {
   stopEverything();
   $("call").classList.add("hidden"); $("login").classList.remove("hidden"); document.body.classList.remove("incall");
-  $("start").disabled = false; $("pin").value = ""; $("state").textContent = ""; resumeToken = ""; prefetchFaceOpts();
+  $("start").disabled = false; $("pin").value = ""; $("state").textContent = ""; resumeToken = "";
+  buildTargets(targets);
+  prefetchFaceOpts();
 }
 
 // ---------------------------------------------------------------- Face ID (passkey). The PIN enrolls the phone once and stays the fallback.
@@ -598,8 +829,55 @@ document.addEventListener("visibilitychange", () => { if (document.visibilitySta
 
 $("login").addEventListener("submit", e => { e.preventDefault(); startCall(); });   // submit (tap or Enter) keeps the user gesture
 $("end").onclick = endCall;
+
+async function setLive(on) {
+  liveMode = !!on;
+  store("live", liveMode ? "true" : "false");
+  setLiveButton();
+  setEarsButton();
+  if (liveMode) {
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "live", on: true }));
+    recogWant = false;
+    stopRecog();
+    showLive("");
+    inSpeech = false; utter = []; preroll = []; utterSamples = prerollSamples = 0; loudMs = 0;
+    stopPlayback();
+    try {
+      await setupMicCapture();
+    } catch (e) {
+      addChip("Microphone unavailable for Live", true);
+      setLive(false);
+      return;
+    }
+  } else {
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "live", on: false }));
+    stopLivePlayback();
+    if (earsPhone) {
+      try { if (node) node.disconnect(); } catch (e) {} node = null;
+      try { if (stream) stream.getTracks().forEach(t => { t.enabled = false; }); } catch (e) {}
+      recogWant = true;
+      startRecog();
+    } else {
+      recogWant = false;
+      stopRecog();
+      try {
+        await setupMicCapture();
+      } catch (e) {
+        addChip("Microphone unavailable", true);
+      }
+    }
+  }
+  render();
+}
+
+$("liveBtn").onclick = async () => {
+  if (!inCall) return;
+  await setLive(!liveMode);
+};
+
 $("earsBtn").onclick = async () => {
   if (!SR || !inCall) return;
+  if (liveMode) await setLive(false);
   earsPhone = !earsPhone; store('ears', earsPhone ? 'phone' : 'mac'); setEarsButton();
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "ears", mode: earsPhone ? "phone" : "mac" }));
   if (earsPhone) {
@@ -619,10 +897,15 @@ $("langBtn").onclick = () => {
 $("stopTalk").onclick = () => { if (inCall) interrupt(); };
 const LOOKS = ["/dot/dot-real.jpg", "/dot/dot-cartoon.jpg"];
 function faceImg(img, src) {
+  if (!img) return;
   const box = img.parentNode;
-  img.onerror = () => { img.classList.add("gone"); box.classList.add("noimg"); };   // no picture: show the ring look only
-  img.onload = () => { img.classList.remove("gone"); box.classList.remove("noimg"); };
+  img.onerror = () => { img.classList.add("gone"); if (box) box.classList.add("noimg"); };   // no picture: show the ring look only
+  img.onload = () => { img.classList.remove("gone"); if (box) box.classList.remove("noimg"); };
   img.src = src;
+  if (img.complete && img.naturalWidth === 0) {
+    img.classList.add("gone");
+    if (box) box.classList.add("noimg");
+  }
 }
 function setLook(i) { const src = LOOKS[(i + LOOKS.length) % LOOKS.length]; faceImg($("dotImg"), src); faceImg($("loginFace").querySelector("img"), src); }
 let look = parseInt(load("dotLook") || "0", 10) || 0; setLook(look);
@@ -647,10 +930,33 @@ function buildTargets(list) {
     };
     box.appendChild(b);
   });
+  if (resumeToken) {
+    box.appendChild(document.createElement("hr"));
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = "Sessions board";
+    b.onclick = () => {
+      $("toMenu").classList.add("hidden");
+      window.open("/board?t=" + encodeURIComponent(resumeToken), "_blank", "noopener,noreferrer");
+    };
+    box.appendChild(b);
+  }
 }
-$("toBtn").onclick = () => $("toMenu").classList.remove("hidden");
+$("toBtn").onclick = () => { buildTargets(targets); $("toMenu").classList.remove("hidden"); };
 $("toMenu").onclick = e => { if (e.target === $("toMenu")) $("toMenu").classList.add("hidden"); };
-$("mute").onclick = () => { muted = !muted; $("mute").classList.toggle("on", muted); $("mute").querySelector(".lbl").textContent = muted ? "Unmute" : "Mute"; if (muted) { inSpeech = false; utter = []; stopRecog(); } recogWant = earsPhone && !muted; render(); };
+$("mute").onclick = () => {
+  muted = !muted;
+  $("mute").classList.toggle("on", muted);
+  $("mute").querySelector(".lbl").textContent = muted ? "Unmute" : "Mute";
+  if (muted) {
+    inSpeech = false; utter = []; stopRecog();
+    liveAcc = []; liveAccLen = 0;
+  }
+  recogWant = !liveMode && earsPhone && !muted;
+  render();
+};
+setLiveButton();
+setEarsButton();
 </script>
 </body>
 </html>

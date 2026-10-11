@@ -9,6 +9,7 @@ Check: python3 server.py --check-config      Self test: python3 server.py --self
 """
 import argparse
 import asyncio
+import base64
 import hmac
 import json
 import os
@@ -19,6 +20,7 @@ import shutil
 import sys
 import threading
 import time
+import urllib.parse
 from http import HTTPStatus
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -36,6 +38,7 @@ from stt import FakeSpeechToText, WhisperSpeechToText, available_engine  # noqa:
 import tts as tts_mod  # noqa: E402
 import updates  # noqa: E402
 from tts import FakeTextToSpeech, default_tts, find_and_store_qwen_key, QwenTextToSpeech  # noqa: E402
+import realtime  # noqa: E402
 
 PORT = 8770
 AUTH_TIMEOUT_S = 20
@@ -76,7 +79,8 @@ class Services:
     """Everything a call needs; tests pass fakes."""
 
     def __init__(self, stt, frontdesk, tts, handoff, guard, allowed_login="", log_calls=False, turn_log=TURN_LOG, passkeys=None):
-        self.stt, self.frontdesk, self.tts, self.handoff = stt, frontdesk, tts, handoff
+        self.stt = self.speech = stt
+        self.frontdesk, self.tts, self.handoff = frontdesk, tts, handoff
         self.guard, self.allowed_login, self.log_calls, self.turn_log = guard, allowed_login, log_calls, turn_log
         self.passkeys = passkeys          # Face ID sign-in (passkey.py); None = PIN only
         self.updates_folder = updates.FOLDER
@@ -110,6 +114,47 @@ def log_turn(path, **kw):
         pass
 
 
+class LiveTools:
+    def __init__(self, call):
+        self.call = call
+
+    async def hand_off(self, words, agent):
+        if getattr(self.call, "handoff_count", 0) >= 6:
+            return "limit reached, tell the caller to use the menu"
+        try:
+            rec = await asyncio.to_thread(self.call.svc.handoff.create, words, words, role=agent)
+        except Exception as e:
+            return "not sent: %s" % (str(e) or type(e).__name__)[:120]
+        if rec and rec.get("posted"):
+            self.call.handoff_count = getattr(self.call, "handoff_count", 0) + 1
+            self.call.posted_handoffs.append({"to": rec.get("to", ""), "words": words})
+            try:
+                await self.call.send({"type": "handoff", "id": rec.get("id", ""), "text": words, "to": rec.get("to", "")})
+            except Exception:
+                pass
+            return "posted to %s" % rec.get("to", agent or "")
+        reason = (rec.get("post_error") if rec else "") or "failed to post"
+        return "not sent: %s" % reason
+
+    async def status(self, question):
+        try:
+            res = await asyncio.to_thread(direct_status, question)
+        except Exception:
+            res = None
+        if res:
+            return str(res).strip()
+        return "No saved status for that."
+
+    async def lookup(self, words):
+        try:
+            import frontdesk
+            notes = await asyncio.to_thread(frontdesk.gather_notes, words, frontdesk.brain_notes)
+        except Exception:
+            return "Nothing found."
+        notes = (notes or "").strip()
+        return notes if notes else "Nothing found."
+
+
 class Call:
     def __init__(self, ws, svc):
         self.ws, self.svc = ws, svc
@@ -117,6 +162,30 @@ class Call:
         self.phone_voice = False
         self.ears = "mac"
         self.task = None
+        self.live = None
+        self.live_pending = False
+        self.posted_handoffs = []
+        self.handoff_count = 0
+        self.started_at = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    def _on_live_closed(self):
+        self.live = None
+
+    async def _live_out(self, item):
+        if isinstance(item, bytes):
+            stopped_at = getattr(self.live, "stopped_at", None) if self.live else None
+            if stopped_at is not None:
+                ms = int((time.monotonic() - stopped_at) * 1000)
+                log_line("live first_audio_ms=%d" % ms, self.svc.turn_log)
+                if self.live:
+                    self.live.stopped_at = None
+            b64 = base64.b64encode(item).decode("ascii")
+            await self.send({"type": "live_audio", "b64": b64})
+        elif isinstance(item, dict):
+            if item.get("type") == "live_error":
+                log_line("live: error %s" % str(item.get("text", ""))[:120], self.svc.turn_log)
+                self.live = None
+            await self.send(item)
 
     async def send(self, obj):
         await self.ws.send(json.dumps(obj, ensure_ascii=False))
@@ -203,6 +272,8 @@ class Call:
             await self.send({"type": "status", "state": "working"})
             try:
                 rec = await asyncio.to_thread(self.svc.handoff.create, reply.handoff, text, target)
+                if rec and rec.get("posted"):
+                    self.posted_handoffs.append({"to": rec.get("to", target), "words": text})
                 await self.send({"type": "handoff", "id": rec.get("id", ""), "text": reply.handoff, "to": rec.get("to", "")})
             except Exception:
                 say = "Sorry, I could not hand that over. Please try again."
@@ -260,7 +331,7 @@ class Call:
         await asyncio.sleep(2)
         while True:
             try:
-                busy = self.task is not None and not self.task.done()
+                busy = (self.task is not None and not self.task.done()) or (self.live is not None and getattr(self.live, "busy", getattr(self.live, "response_active", False)))
                 if not busy:
                     items = await asyncio.to_thread(updates.pending, self.svc.updates_folder)
                     if items:
@@ -276,9 +347,14 @@ class Call:
             await asyncio.sleep(3)
 
     async def _say_update(self, line):
+        if self.live and getattr(self.live, "busy", False):
+            return
         self.history.append({"role": "assistant", "text": line})
         await self.send({"type": "transcript", "role": "assistant", "text": line})
-        await self.speak(line)
+        if self.live:
+            await self.live.say_exact(line)
+        else:
+            await self.speak(line)
 
     async def _keepalive(self):
         """Keep the speech model and the front-desk process resident in memory while a call is open (idle processes get swapped out on this Mac)."""
@@ -328,23 +404,76 @@ class Call:
         try:
             async for msg in self.ws:
                 if isinstance(msg, bytes):
-                    log_line("call: utterance received, %.1fs" % (len(msg) / 32000.0), self.svc.turn_log)
-                    await self.cancel_turn()  # a new utterance replaces whatever was in progress
-                    self.task = asyncio.create_task(self._guarded_turn(msg))
+                    if self.live_pending:
+                        continue
+                    if self.live and not getattr(self.live, "closed", False):
+                        await self.live.feed_audio(msg)
+                    else:
+                        self.live = None
+                        if len(msg) < 16000:
+                            continue
+                        log_line("call: utterance received, %.1fs" % (len(msg) / 32000.0), self.svc.turn_log)
+                        await self.cancel_turn()  # a new utterance replaces whatever was in progress
+                        self.task = asyncio.create_task(self._guarded_turn(msg))
                 else:
                     try:
                         data = json.loads(msg)
                     except ValueError:
                         continue
                     kind = data.get("type")
-                    if kind == "interrupt":
+                    if kind == "live":
+                        if data.get("on"):
+                            self.live_pending = True
+                            try:
+                                if self.live:
+                                    await self.live.close()
+                                    self.live = None
+                                transcribe_fn = getattr(getattr(self.svc, "speech", None) or getattr(self.svc, "stt", None), "transcribe", None)
+                                bridge = realtime.LiveBridge(
+                                    self._live_out,
+                                    LiveTools(self),
+                                    realtime.build_instructions(config.get("owner")),
+                                    transcribe=transcribe_fn,
+                                    on_closed=self._on_live_closed,
+                                    turn_log=self.svc.turn_log,
+                                )
+                                try:
+                                    await asyncio.wait_for(bridge.start(), 15)   # never block the call on a silent provider
+                                except BaseException:
+                                    try:
+                                        await bridge.close()
+                                    except Exception:
+                                        pass
+                                    raise
+                                self.live = bridge
+                                self.live_pending = False
+                                await self.send({"type": "live_ok"})
+                                log_line("live: on", self.svc.turn_log)
+                            except Exception as e:
+                                self.live = None
+                                self.live_pending = False
+                                reason = (str(e) or type(e).__name__)[:120]
+                                await self.send({"type": "live_error", "text": reason})
+                                log_line("live: error %s" % reason, self.svc.turn_log)
+                        else:
+                            self.live_pending = False
+                            if self.live:
+                                await self.live.close()
+                                self.live = None
+                                log_line("live: off", self.svc.turn_log)
+                    elif kind == "interrupt":
                         await self.cancel_turn()
+                        if self.live:
+                            await self.live.cancel()
                         await self.send({"type": "status", "state": "listening"})
                     elif kind == "text":
-                        said = str(data.get("text", "")).strip()[:600]
-                        if len(said) >= 2:
-                            await self.cancel_turn()
-                            self.task = asyncio.create_task(self._guarded_turn(None, said))
+                        if self.live:
+                            pass
+                        else:
+                            said = str(data.get("text", "")).strip()[:600]
+                            if len(said) >= 2:
+                                await self.cancel_turn()
+                                self.task = asyncio.create_task(self._guarded_turn(None, said))
                     elif kind == "ears":
                         self.ears = "phone" if data.get("mode") == "phone" else "mac"
                     elif kind == "target":
@@ -378,6 +507,45 @@ class Call:
                 if t:
                     t.cancel()
             await self.cancel_turn()
+            if self.live:
+                try:
+                    await self.live.close()
+                except Exception:
+                    pass
+                self.live = None
+                log_line("live: off", self.svc.turn_log)
+            self._write_call_summary()
+
+    def _write_call_summary(self):
+        try:
+            from status import PRIVATE_ROLES
+            valid = [
+                {"to": h["to"], "words": h["words"]}
+                for h in self.posted_handoffs
+                if h.get("to") and h.get("to") not in PRIVATE_ROLES
+            ]
+            if not valid:
+                return
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            ended = time.strftime("%Y-%m-%d %H:%M:%S")
+            summary = {
+                "source": "voice_call_summary",
+                "handoffs": valid,
+                "started": getattr(self, "started_at", ended),
+                "ended": ended,
+            }
+            handoff_dir = getattr(getattr(self, "svc", None), "handoff", None)
+            folder = getattr(handoff_dir, "folder", None) or os.path.join(HERE, "handoff")
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, "%s-call-summary.json" % stamp)
+            n = 1
+            while os.path.exists(path):
+                n += 1
+                path = os.path.join(folder, "%s-call-summary-%d.json" % (stamp, n))
+            with open(path, "w") as f:
+                json.dump(summary, f, indent=2)
+        except Exception:
+            pass
 
     async def _guarded_turn(self, pcm, text=None):
         try:
@@ -431,6 +599,21 @@ def make_process_request(svc=None):
             del resp.headers["Content-Type"]
             resp.headers["Content-Type"] = "application/json"
             resp.headers["Cache-Control"] = "no-store"
+            return resp
+        if request.path.split("?")[0] == "/board":   # read-only Sessions Board; only for a signed-in call page (its token)
+            q = urllib.parse.parse_qs(request.path.partition("?")[2])
+            if not svc or not svc.resume_ok((q.get("t") or [""])[0]) or not login_ok(request.headers, svc.allowed_login):
+                return connection.respond(HTTPStatus.FORBIDDEN, "Open the board from the call menu after signing in.\n")
+            try:
+                body = open(config.path("board_file"), encoding="utf-8").read()
+            except OSError:
+                return connection.respond(HTTPStatus.NOT_FOUND, "board not built yet\n")
+            resp = connection.respond(HTTPStatus.OK, body)
+            for k, v in (("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store"),
+                         ("Referrer-Policy", "no-referrer")):
+                if k in resp.headers:
+                    del resp.headers[k]
+                resp.headers[k] = v
             return resp
         if request.path == "/healthz":
             return connection.respond(HTTPStatus.OK, "ok\n")
