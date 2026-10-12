@@ -431,8 +431,15 @@ class ServerLiveTest(unittest.IsolatedAsyncioTestCase):
             res = await tools.status("what is CRM doing")
             self.assertEqual(res, "CRM is updating leads")
 
-        with mock.patch("server.direct_status", return_value=None):
-            res = await tools.status("what is happening")
+        # 2026-10-11 her real call: "check my tasks" matched no status phrase and got "No saved status".
+        # The model only calls get_status for status questions, so an unmatched one gets the all-sessions overview.
+        with mock.patch("server.direct_status", return_value=None), \
+                mock.patch("status.overview", return_value="Latest from your sessions: CRM fixing notes"):
+            res = await tools.status("check my tasks")
+            self.assertEqual(res, "Latest from your sessions: CRM fixing notes")
+
+        with mock.patch("server.direct_status", return_value=None), mock.patch("status.overview", return_value=None):
+            res = await tools.status("check my tasks")
             self.assertEqual(res, "No saved status for that.")
 
     async def test_live_tools_lookup(self):

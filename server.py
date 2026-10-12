@@ -192,6 +192,13 @@ class LiveTools:
             res = await asyncio.to_thread(direct_status, question)
         except Exception:
             res = None
+        if not res:   # the model asked for status but the phrase matched no rule ("check my tasks"): all sessions
+            try:
+                import status as status_mod
+                res = await asyncio.to_thread(status_mod.overview, status_mod.CARRYOVER, time.time(),
+                                              status_mod.session_titles())
+            except Exception:
+                res = None
         if res:
             return str(res).strip()
         return "No saved status for that."
