@@ -86,12 +86,14 @@ class GeminiBridge(realtime.LiveBridge):
         self._resumes = []           # times of recent resumes (cap)
         self._resume_lock = asyncio.Lock()
         self._seeded = False
+        self._play_until = 0.0       # when the phone finishes playing what was sent (Gemini sends faster than real time)
         self._turn_started = 0.0
 
     @property
     def busy(self):
-        draining = bool(self._draining and time.monotonic() - self._draining < 8.0)
-        return bool(super().busy or draining)
+        now = time.monotonic()
+        draining = bool(self._draining and now - self._draining < 8.0)
+        return bool(super().busy or draining or now < self._play_until)
 
     @property
     def user_speaking(self):
@@ -111,7 +113,10 @@ class GeminiBridge(realtime.LiveBridge):
             input_audio_transcription=types.AudioTranscriptionConfig(),
             output_audio_transcription=types.AudioTranscriptionConfig(),
             session_resumption=types.SessionResumptionConfig(handle=handle),
-            context_window_compression=types.ContextWindowCompressionConfig(sliding_window=types.SlidingWindow()),
+            # Free tier allows 65K tokens/min and each turn sends the whole context (measured ~1K tokens a turn,
+            # growing): keep the context small so a long call never hits the limit.
+            context_window_compression=types.ContextWindowCompressionConfig(
+                trigger_tokens=8000, sliding_window=types.SlidingWindow(target_tokens=4000)),
         )
 
     async def start(self):
@@ -230,6 +235,7 @@ class GeminiBridge(realtime.LiveBridge):
 
     async def cancel(self):
         # No cancel in the Live API: drop the rest of this reply (same effect for her as a barge-in).
+        self._play_until = 0.0
         if self.response_active:
             self._drop_audio = True
             self._draining = time.monotonic()
@@ -357,6 +363,10 @@ class GeminiBridge(realtime.LiveBridge):
         self._user_speaking = True
         self._activity_at = time.monotonic()
         self.stopped_at = None
+        if self._activity_at < self._play_until:
+            # Gemini finished the reply but the phone is still playing its tail: stop it, she is talking.
+            self._play_until = 0.0
+            await self.send_to_phone({"type": "live_stop"})
 
     async def _on_content(self, sc):
         it = getattr(sc, "input_transcription", None)
@@ -379,6 +389,7 @@ class GeminiBridge(realtime.LiveBridge):
                     self._turn_words = self._turn_transcript
                 self._transcript_done.set()
         if sc.interrupted:
+            self._play_until = 0.0
             await self._send_heard()
             self._start_turn()
             self._user_speaking = True
@@ -391,6 +402,8 @@ class GeminiBridge(realtime.LiveBridge):
                 if data:
                     await self._end_turn()
                     if not self._drop_audio:
+                        now = time.monotonic()
+                        self._play_until = max(now, self._play_until) + len(data) / 48000.0
                         await self.send_to_phone(bytes(data))
         ot = getattr(sc, "output_transcription", None)
         if ot is not None and ot.text:

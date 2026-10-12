@@ -257,6 +257,30 @@ class GeminiBridgeTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"\x03", self.phone)
         await self.b.close()
 
+    async def test_barge_in_on_reply_tail_stops_phone(self):
+        await self.make()
+        self.s.push(audio(b"\x01" * 96000))   # 2 s of reply, sent at once
+        self.s.push(done())
+        await self.settle()
+        self.assertTrue(self.b.busy)   # the phone is still playing
+        self.s.push(NS(voice_activity=NS(voice_activity_type="ACTIVITY_START")))
+        await self.settle()
+        self.assertEqual(len(self.dicts("live_stop")), 1)
+        self.assertEqual(self.b._play_until, 0.0)
+        self.assertTrue(self.b.user_speaking)
+        await self.b.close()
+
+    async def test_idle_noise_after_tail_does_not_stop(self):
+        await self.make()
+        self.s.push(audio(b"\x01" * 2))
+        self.s.push(done())
+        await self.settle()
+        await asyncio.sleep(0.01)
+        self.s.push(NS(voice_activity=NS(voice_activity_type="ACTIVITY_START")))
+        await self.settle()
+        self.assertFalse(self.dicts("live_stop"))
+        await self.b.close()
+
     async def test_noise_during_reply_does_not_cut_dot_off(self):
         await self.make()
         self.s.push(audio(b"\x01"))
