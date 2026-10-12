@@ -4,7 +4,9 @@ Selected by config live_provider == "gemini". Key: the Keychain entry named by K
 Gemini has no turn ids, so a turn is tracked from the stream: her turn runs from the end of Dot's last reply
 (turn_complete / interrupted) until Dot's first output (audio, words or a tool call).
 """
+import array
 import asyncio
+import math
 import time
 
 import realtime
@@ -18,6 +20,28 @@ PIECE = 9600        # 0.2 s of 24 kHz pcm16 per phone message
 AHEAD_S = 1.0       # keep at most this much audio queued on the phone
 QUOTA_WORDS = ("429", "resource_exhausted", "resource exhausted", "quota", "rate limit")
 QUOTA_PAUSE_S = 3600   # free quota used up: Qwen for an hour, then try Gemini again
+SILENCE_MS = 800       # quiet time that ends her turn (a short pause mid-sentence must not; R3)
+VA_CONFIRM_S = 0.25    # a voice-activity start counts as her barge-in only after this long AND with her voice level
+VA_CONFIRM_MAX_S = 1.2  # ...seen within this long (speaker echo starts "activity" but is quiet in her mic)
+ECHO_GRACE_S = 0.6     # Dot's first moments of sound: a voice start needs this long to count (speaker echo)
+LATE_S = 2.0           # her words this soon after Dot started answering belong to the turn Dot is answering
+RECENT_BYTES = 48000   # 1.5 s of her audio kept while Dot plays, so a barge-in keeps her first words
+ONSET_PAD_S = 0.3      # audio kept from before her voice started
+TAIL_KEEP = 9600       # 0.3 s: all that is kept of the mic while Dot plays and she is quiet (no echo in hand-offs)
+VOICE_HANG_S = 0.3     # her voice stretch ends after this much quiet (one stretch spans gaps between words)
+VOICE_MIN_S = 0.2      # loud time in a stretch before it counts as her voice
+ECHO_RATIO = 2.5       # while Dot plays, her voice must be this much louder than the mic's level during Dot's sound
+ECHO_GROWTH = 1.5      # the learned echo level may grow at most this much per reply (her voice can't teach it)
+SPEECH_RMS = 700       # server-side voice level floor (pcm16 RMS), above 3x the room noise
+CLEAR_VOICE_RMS = 5000  # her voice close to the phone; echo left after the phone's echo cancel stays below it
+
+
+def _rms(pcm):
+    a = array.array("h")
+    a.frombytes(pcm[:len(pcm) - len(pcm) % 2])
+    if not a:
+        return 0.0
+    return math.sqrt(sum(x * x for x in a) / len(a))
 
 
 def _note_quota(reason):
@@ -88,6 +112,7 @@ class GeminiBridge(realtime.LiveBridge):
         self._resumes = []           # times of recent resumes (cap)
         self._resume_lock = asyncio.Lock()
         self._seeded = False
+        self._barge_started = False  # a barge-in stopped Dot before this reply's turn_complete
         self._play_until = 0.0       # when the phone finishes playing what was sent
         # Gemini sends a whole reply in about a second; the phone got scratchy on such bursts, so audio
         # is paced out at speaking speed like Qwen's stream.
@@ -95,6 +120,22 @@ class GeminiBridge(realtime.LiveBridge):
         self._out_gen = 0
         self._out_task = None
         self._turn_started = 0.0
+        self._turn_ended = 0.0       # when Dot started answering
+        self._play_started = 0.0     # when the phone started playing the current stretch of audio
+        self._va_token = 0           # bumps on every voice-activity start/end (a pending confirm checks it)
+        self._recent_said = ""       # Dot's words of this and the last reply (to spot her mic hearing Dot)
+        # One voice detector on her mic audio (server side), used by everything that asks "is she talking?"
+        self._floor = 300.0          # room noise level while Dot is quiet
+        self._play_floor = 0.0       # mic level while Dot plays (speaker echo left after the phone's echo cancel)
+        self._play_cap = SPEECH_RMS  # this reply's ceiling for _play_floor
+        self._voice_s = 0.0          # loud time in her current voice stretch
+        self._quiet_s = 0.0          # quiet time since her last loud chunk
+        self._voice_bytes = 0        # audio since her current stretch began (her onset, counted in audio)
+        self._reply_levels = []      # mic levels while Dot played (logged per reply: measures the echo)
+        self._was_playing = False
+        self._va_start_at = 0.0      # when the last voice-activity start came
+        self._recent = b""           # her last 1.5 s of audio
+        self._confirms = set()       # pending voice-start confirmations
 
     @property
     def busy(self):
@@ -117,18 +158,26 @@ class GeminiBridge(realtime.LiveBridge):
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=self.voice))),
             system_instruction=self.instructions,
             tools=gemini_tools(),
+            # Measured on the real API 2026-10-11: the default ended her turn at a 0.7 s pause mid-sentence (Dot
+            # answered half a sentence); low end sensitivity + 800 ms kept it (reply ~1.0 s after she stops).
+            # Low START sensitivity made Gemini deaf (no reply at all): keep the default start.
+            realtime_input_config=types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
+                    prefix_padding_ms=300,
+                    silence_duration_ms=int(realtime._cfg("live_silence_ms_gemini") or SILENCE_MS))),
             input_audio_transcription=types.AudioTranscriptionConfig(),
             output_audio_transcription=types.AudioTranscriptionConfig(),
             session_resumption=types.SessionResumptionConfig(handle=handle),
             # Free tier allows 65K tokens/min and each turn sends the whole context (measured ~1K tokens a turn,
-            # growing): keep the context small so a long call never hits the limit.
+            # growing 100-150): 16K keeps a long call under the limit; 8K forgot the start of a call too soon.
             context_window_compression=types.ContextWindowCompressionConfig(
-                trigger_tokens=8000, sliding_window=types.SlidingWindow(target_tokens=4000)),
+                trigger_tokens=16000, sliding_window=types.SlidingWindow(target_tokens=8000)),
         )
 
     async def start(self):
         self._key = tts._keychain(KEYCHAIN)
-        if not self._key:
+        if not self._key and self._connect is sdk_connect:   # a test or --fake connect needs no key
             raise RuntimeError("no Gemini key")
         try:
             self.session = await self._connect(self.model, config=self._config(), api_key=self._key)
@@ -154,6 +203,8 @@ class GeminiBridge(realtime.LiveBridge):
                 if gen != self._out_gen or self._drop_audio or self.closed:
                     continue
             now = time.monotonic()
+            if self._play_until <= now:
+                self._play_started = now
             self._play_until = max(now, self._play_until) + len(piece) / 48000.0
             try:
                 await self.send_to_phone(piece)
@@ -221,6 +272,8 @@ class GeminiBridge(realtime.LiveBridge):
             self._out_task.cancel()
         if self.tool_task and self.tool_task is not asyncio.current_task():
             self.tool_task.cancel()
+        for t in list(self._confirms):
+            t.cancel()
         if self.session is not None:
             try:
                 await self.session.close()
@@ -233,10 +286,16 @@ class GeminiBridge(realtime.LiveBridge):
         if self.closed or self.session is None:
             return
         self._preroll = (self._preroll + pcm)[-16000:]
-        if self._in_turn:   # rolling: the last 30 s, so a long silence before she speaks never crowds out her words
-            self._turn_buf.extend(pcm)
-            if len(self._turn_buf) > TURN_CAP:
-                del self._turn_buf[:len(self._turn_buf) - TURN_CAP]
+        self._recent = (self._recent + pcm)[-RECENT_BYTES:]
+        playing = time.monotonic() < self._play_until
+        self._local_vad(pcm, playing)
+        if self._in_turn:
+            if playing:   # Dot's tail plays: her audio from her voice onset if she talks, else only 0.3 s (no echo)
+                self._turn_buf = bytearray(self._onset_audio() if self._her_voice() else self._recent[-TAIL_KEEP:])
+            else:   # rolling: the last 30 s, so a long silence before she speaks never crowds out her words
+                self._turn_buf.extend(pcm)
+                if len(self._turn_buf) > TURN_CAP:
+                    del self._turn_buf[:len(self._turn_buf) - TURN_CAP]
         if self._reconnecting:
             if sum(len(p) for p in self._pending_audio) < 160000:   # up to 5 s, sent after the resume
                 self._pending_audio.append(pcm)
@@ -250,10 +309,69 @@ class GeminiBridge(realtime.LiveBridge):
             if not self._reconnecting:
                 await self._fail(str(e) or type(e).__name__)
 
+    def _local_vad(self, pcm, playing):
+        """Her voice in her own mic. Speaker echo is judged against the mic level measured while Dot plays, so it
+        never counts as her voice; a stretch spans the gaps between her words (VOICE_HANG_S)."""
+        level = _rms(pcm)
+        dur = len(pcm) / 32000.0
+        thr = max(SPEECH_RMS, 3 * self._floor)
+        if playing:
+            if not self._was_playing:   # a new stretch of Dot's sound: cap how far the echo level may rise
+                self._play_cap = max(SPEECH_RMS, ECHO_GROWTH * self._play_floor)
+            thr = max(thr, ECHO_RATIO * self._play_floor)
+            self._reply_levels.append(int(level))
+        elif self._was_playing:
+            self._log_reply_levels()
+        self._was_playing = playing
+        if playing and time.monotonic() - self._play_started < ECHO_GRACE_S:
+            thr = max(thr, CLEAR_VOICE_RMS)   # Dot's first moments: learn the echo; only a clear voice is hers
+        loud = level > thr
+        if not loud:   # learn the quiet levels (and the echo level while Dot plays) from non-voice audio
+            if playing:   # capped: if she talks as Dot starts, her voice must not become "echo"
+                self._play_floor = 0.9 * self._play_floor + 0.1 * min(level, self._play_cap)
+            elif level < self._floor:
+                self._floor = 0.5 * self._floor + 0.5 * max(level, 50.0)
+            else:
+                self._floor += (level - self._floor) * 0.002
+        if loud:
+            if not self._voice_s:
+                self._voice_bytes = 0
+            self._voice_s += dur
+            self._quiet_s = 0.0
+        elif self._voice_s:
+            self._quiet_s += dur
+            if self._quiet_s >= VOICE_HANG_S:
+                self._voice_s = 0.0
+        if self._voice_s:
+            self._voice_bytes += len(pcm)
+        if self._her_voice() and self._in_turn and not playing:
+            self._user_speaking = True
+            self._activity_at = time.monotonic()
+            self.stopped_at = None
+
+    def _her_voice(self):
+        return self._voice_s >= VOICE_MIN_S
+
+    def _log_reply_levels(self):
+        lv = sorted(self._reply_levels)
+        self._reply_levels = []
+        if lv:   # G5: measures the echo on her phone (her voice over Dot shows as a high p95)
+            self._log_line("live: mic during reply p50=%d p95=%d echo_floor=%d" % (
+                lv[len(lv) // 2], lv[int(len(lv) * 0.95)], self._play_floor))
+
+    async def barge(self):
+        """The phone heard her voice over Dot's reply (it already stopped its own playback)."""
+        if self._in_turn and not self._activity_at:
+            self._user_speaking = True
+            self._activity_at = time.monotonic()
+        await self._barge_in("phone")
+
     async def say_exact(self, text):
         if self.closed or self.session is None:
             return
         types = _types()
+        if self._draining and time.monotonic() - self._draining > 8.0:   # its turn_complete never came
+            self._draining = 0.0
         if self._draining:
             self._exact_pending = True   # the old reply's turn_complete must not end this one
         else:
@@ -330,7 +448,8 @@ class GeminiBridge(realtime.LiveBridge):
         self._whisper_words = None
         self._transcript_done.clear()
         self.turn_pcm = b""
-        self._turn_buf = bytearray(self._preroll)
+        self._turn_buf = bytearray(self._onset_audio() if self._barge_started else self._preroll)
+        self._barge_started = False
 
     async def _end_turn(self):
         """Dot starts answering: her turn is over."""
@@ -342,6 +461,7 @@ class GeminiBridge(realtime.LiveBridge):
             self.stopped_at = self._activity_at if self._activity_at else time.monotonic()
         self.turn_pcm = bytes(self._turn_buf)
         self.response_active = True
+        self._turn_ended = time.monotonic()
         if self._heard.strip():
             self._turn_transcript = self.last_heard = self._turn_words = self._heard.strip()
             self._transcript_done.set()
@@ -359,6 +479,9 @@ class GeminiBridge(realtime.LiveBridge):
         va = getattr(msg, "voice_activity", None)
         if va is not None:
             kind = str(getattr(va.voice_activity_type, "value", va.voice_activity_type) or "")
+            self._log_line("live: va %s in_turn=%s playing=%.1fs" % (kind.rsplit("_", 1)[-1], self._in_turn,
+                                                                      max(0.0, self._play_until - time.monotonic())))
+            self._va_token += 1
             if kind.endswith("ACTIVITY_START"):
                 await self._speech_started()
             elif kind.endswith("ACTIVITY_END"):
@@ -387,32 +510,73 @@ class GeminiBridge(realtime.LiveBridge):
         except Exception as e:
             await self._fail("resume failed: " + (str(e) or type(e).__name__)[:80])
 
+    def _dot_sounding(self):
+        return time.monotonic() < self._play_until or not self._out_q.empty()
+
+    def _onset_audio(self):
+        """Her recent audio from just before her voice started (her first words, not Dot's echo before them)."""
+        if self._voice_s:   # her current voice stretch, counted in audio (not wall clock)
+            back = self._voice_bytes / 32000.0
+        elif self._va_start_at:
+            back = time.monotonic() - self._va_start_at
+        else:
+            back = 1.0
+        keep = min(RECENT_BYTES, int(max(0.3, back + ONSET_PAD_S) * 32000) & ~1)
+        return self._recent[-keep:]
+
+    async def _barge_in(self, why):
+        """She talks over Dot: stop the phone NOW (her requirement 2026-10-11: "when I interrupt, it stop
+        talking"). Gemini sends a reply far ahead of playback, so its own interrupted often never comes."""
+        if not (self._dot_sounding() or (not self._in_turn and self.response_active)):
+            return False
+        self._log_line("live: she interrupted, Dot stopped (%s) voice=%.1fs echo_floor=%d" % (
+            why, self._voice_s, self._play_floor))
+        self._flush_audio()
+        if self._in_turn:   # the tail of a finished reply: her turn audio starts at her voice
+            self._turn_buf = bytearray(self._onset_audio())
+        else:
+            self._barge = True               # her words from now on start her next turn
+            self._barge_started = True
+            self._drop_audio = True          # the rest of this reply, until its turn_complete
+            self._draining = time.monotonic()
+            self.response_active = False
+        await self.send_to_phone({"type": "live_stop"})
+        return True
+
+    async def _confirm_voice(self, token, wait):
+        """A voice start stops Dot only if it lasts and her mic is really loud (echo starts activity too, and with
+        a long end-of-speech silence its end event can never come in time)."""
+        try:
+            await asyncio.sleep(wait)
+            deadline = time.monotonic() + VA_CONFIRM_MAX_S
+            while token == self._va_token and not self.closed and time.monotonic() < deadline:
+                if self._her_voice():
+                    await self._barge_in("voice")
+                    return
+                await asyncio.sleep(0.05)
+        finally:
+            self._confirms.discard(asyncio.current_task())
+
     async def _speech_started(self):
-        if not self._in_turn:
-            # She talks while Dot answers: stop Dot NOW (her requirement 2026-10-11: "when I interrupt, it stop
-            # talking"). Gemini sends a reply far ahead of playback, so its own interrupted often never comes.
-            self._barge = True
-            if time.monotonic() < self._play_until or not self._out_q.empty() or self.response_active:
-                self._log_line("live: she interrupted, Dot stopped")
-                self._flush_audio()
-                self._drop_audio = True          # the rest of this reply, until its turn_complete
-                self._draining = time.monotonic()
-                self.response_active = False
-                await self.send_to_phone({"type": "live_stop"})
-            return
-        self._user_speaking = True
-        self._activity_at = time.monotonic()
-        self.stopped_at = None
-        if self._activity_at < self._play_until:
-            # Gemini finished the reply but the phone is still playing its tail: stop it, she is talking.
-            self._flush_audio()
-            await self.send_to_phone({"type": "live_stop"})
+        now = time.monotonic()
+        self._va_start_at = now
+        if self._in_turn:
+            self._user_speaking = True
+            self._activity_at = now
+            self.stopped_at = None
+        if self._dot_sounding() or not self._in_turn:
+            wait = VA_CONFIRM_S if now - self._play_started > ECHO_GRACE_S else ECHO_GRACE_S
+            self._confirms.add(asyncio.ensure_future(self._confirm_voice(self._va_token, wait)))
+
+    def _late(self):
+        return time.monotonic() - self._turn_ended < LATE_S
 
     async def _on_content(self, sc):
+        # Words never stop Dot (her own late words and Dot's echo arrive as words too); only her voice does.
         it = getattr(sc, "input_transcription", None)
         if it is not None and it.text:
-            late = (self._in_turn and not self._seeded and not self._activity_at
-                    and time.monotonic() - self._turn_started < 2.0)
+            late = (self._in_turn and not self._seeded and not self._activity_at and self._late()
+                    and time.monotonic() - self._turn_started < LATE_S)
             if late:   # the last turn's words arriving after its turn_complete: not part of this turn
                 self.last_heard = ((self.last_heard or "") + " " + it.text).strip()
             elif self._in_turn:
@@ -421,7 +585,7 @@ class GeminiBridge(realtime.LiveBridge):
                 self.stopped_at = None
                 self._heard += it.text
                 await self.send_to_phone({"type": "live_partial", "text": self._heard.strip()})
-            elif self._barge:   # she talks over Dot: these words start her next turn
+            elif self._barge:   # she stopped Dot: these words start her next turn
                 self._barge_heard += it.text
                 await self.send_to_phone({"type": "live_partial", "text": self._barge_heard.strip()})
             else:   # late words for the turn that just ended
@@ -431,6 +595,7 @@ class GeminiBridge(realtime.LiveBridge):
                     self._turn_words = self._turn_transcript
                 self._transcript_done.set()
         if sc.interrupted:
+            self._log_line("live: gemini interrupted playing=%.1fs" % max(0.0, self._play_until - time.monotonic()))
             self._flush_audio()
             await self._send_heard()
             self._start_turn()
@@ -455,6 +620,7 @@ class GeminiBridge(realtime.LiveBridge):
             await self._send_heard()
             said = self._said.strip()
             self._said = ""
+            self._recent_said = said
             if said and not self._drop_audio:
                 await self.send_to_phone({"type": "live_said", "text": said})
             if not self._in_turn or self._draining:

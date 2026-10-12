@@ -107,6 +107,10 @@ class GeminiBridgeTest(unittest.IsolatedAsyncioTestCase):
             await self.b.start()
         self.s = self.sessions[0]
 
+    async def talk(self, seconds):
+        for _ in range(int(seconds / 0.1)):
+            await self.b.feed_audio(b"\x00\x30" * 1600)   # 0.1 s of her loud voice
+
     async def settle(self):
         for _ in range(20):
             await asyncio.sleep(0)
@@ -127,8 +131,10 @@ class GeminiBridgeTest(unittest.IsolatedAsyncioTestCase):
         await self.b.close()
 
     async def test_missing_key_raises(self):
-        with self.assertRaises(RuntimeError):
-            await self.make(key=None)
+        with mock.patch.object(gemini_live.tts, "_keychain", return_value=None):
+            b = gemini_live.GeminiBridge(None, Tools(), "be brief")
+            with self.assertRaises(RuntimeError):
+                await b.start()
 
     async def test_audio_to_phone_and_words(self):
         await self.make()
@@ -279,6 +285,8 @@ class GeminiBridgeTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.b.busy)   # the phone is still playing
         self.s.push(NS(voice_activity=NS(voice_activity_type="ACTIVITY_START")))
         await self.settle()
+        await self.talk(0.3)   # her voice in the mic
+        await asyncio.sleep(gemini_live.ECHO_GRACE_S + 0.1)   # a voice start counts once it lasts (not an echo)
         self.assertEqual(len(self.dicts("live_stop")), 1)
         self.assertEqual(self.b._play_until, 0.0)
         self.assertTrue(self.b.user_speaking)
@@ -300,10 +308,12 @@ class GeminiBridgeTest(unittest.IsolatedAsyncioTestCase):
         await self.make()
         self.s.push(audio(b"\x01" * 144000))   # 3 s reply
         await self.settle()
-        sent = sum(len(m) for m in self.phone if isinstance(m, bytes))
         self.s.push(NS(voice_activity=NS(voice_activity_type="ACTIVITY_START")))
         await self.settle()
+        await self.talk(0.3)
+        await asyncio.sleep(gemini_live.ECHO_GRACE_S + 0.1)
         self.assertEqual(len(self.dicts("live_stop")), 1)
+        sent = sum(len(m) for m in self.phone if isinstance(m, bytes))
         self.s.push(audio(b"\x02" * 9600))     # Gemini keeps generating the old reply
         await self.settle()
         await asyncio.sleep(0.3)
@@ -311,13 +321,166 @@ class GeminiBridgeTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(b"\x02" * 9600, self.phone)
         await self.b.close()
 
+    async def test_echo_blip_does_not_stop_dot(self):
+        # Speaker echo: a voice start that ends at once must not cut Dot off.
+        await self.make()
+        self.s.push(audio(b"\x01" * 144000))
+        await self.settle()
+        self.s.push(NS(voice_activity=NS(voice_activity_type="ACTIVITY_START")))
+        self.s.push(NS(voice_activity=NS(voice_activity_type="ACTIVITY_END")))
+        await self.settle()
+        await asyncio.sleep(gemini_live.ECHO_GRACE_S + 0.1)
+        self.assertFalse(self.dicts("live_stop"))
+        await self.b.close()
+
+    async def test_echo_voice_start_without_her_level_does_not_stop(self):
+        # Echo makes the service report activity, but her mic is quiet: Dot keeps talking (R2 echo).
+        await self.make()
+        self.s.push(audio(b"\x01" * 192000))
+        await self.settle()
+        self.s.push(NS(voice_activity=NS(voice_activity_type="ACTIVITY_START")))
+        await self.settle()
+        await asyncio.sleep(gemini_live.ECHO_GRACE_S + gemini_live.VA_CONFIRM_MAX_S + 0.1)
+        self.assertFalse(self.dicts("live_stop"))
+        await self.b.close()
+
+    async def test_late_words_do_not_stop_reply_tail(self):
+        # Review blocker: her last words arrive after Gemini's turn_complete while the tail plays; not a barge-in.
+        await self.make()
+        self.s.push(heard("check my"))
+        self.s.push(audio(b"\x01" * 96000))
+        self.s.push(done())
+        await self.settle()
+        self.s.push(heard(" tasks please"))
+        await self.settle()
+        self.assertFalse(self.dicts("live_stop"))
+        self.assertIn("tasks please", self.b.last_heard)
+        await self.b.close()
+
+    async def test_barge_keeps_her_first_words_for_hand_off(self):
+        # R15: after a barge-in on the tail, the turn audio starts at her voice (not 0.3 s before the stop).
+        await self.make()
+        self.s.push(audio(b"\x01" * 192000))
+        self.s.push(done())
+        await self.settle()
+        await asyncio.sleep(gemini_live.ECHO_GRACE_S)
+        self.s.push(NS(voice_activity=NS(voice_activity_type="ACTIVITY_START")))
+        await self.settle()
+        await self.talk(0.8)          # she talks for 0.8 s (audio arrives faster than real time here)
+        await asyncio.sleep(gemini_live.VA_CONFIRM_S + 0.1)
+        self.assertEqual(len(self.dicts("live_stop")), 1)
+        self.assertGreaterEqual(len(self.b._turn_buf), int(0.8 * 32000))
+        await self.b.close()
+
+    async def test_page_barge_stops_dot_without_voice_events(self):
+        # R2 with no voice-activity event at all: the phone heard her and says so.
+        await self.make()
+        self.s.push(audio(b"\x01" * 240000))
+        self.s.push(done())
+        await self.settle()
+        await self.b.barge()
+        self.assertEqual(len(self.dicts("live_stop")), 1)
+        self.assertEqual(self.b._play_until, 0.0)
+        await self.b.close()
+
+    async def test_echo_level_during_reply_is_not_her_voice(self):
+        # G5/R2: steady speaker echo in her mic while Dot plays never counts as her; her real voice over it does.
+        await self.make()
+        self.s.push(audio(b"\x01" * 240000))   # 5 s reply
+        await self.settle()
+        echo = b"\x00\x06" * 1600               # 0.1 s at ~1500 RMS (above the 700 floor)
+        for _ in range(10):
+            await self.b.feed_audio(echo)
+        self.s.push(NS(voice_activity=NS(voice_activity_type="ACTIVITY_START")))
+        await self.settle()
+        for _ in range(8):
+            await self.b.feed_audio(echo)
+        await asyncio.sleep(gemini_live.ECHO_GRACE_S + 0.1)
+        self.assertFalse(self.dicts("live_stop"))
+        await self.talk(0.3)                      # her voice, far above the echo
+        await asyncio.sleep(0.15)
+        self.assertEqual(len(self.dicts("live_stop")), 1)
+        await self.b.close()
+
+    async def test_talking_as_dot_starts_is_not_learned_as_echo(self):
+        # Review round 3 blocker: she talks (normal level) from Dot's first moment; after the echo grace her voice
+        # must still stop Dot.
+        await self.make()
+        self.s.push(audio(b"\x01" * 240000))
+        await self.settle()
+        voice = b"\x00\x0a" * 1600              # 0.1 s at ~2560 RMS: a normal voice, under the clear-voice level
+        for _ in range(8):                        # during the grace: learned as echo, but capped
+            await self.b.feed_audio(voice)
+        await asyncio.sleep(gemini_live.ECHO_GRACE_S)
+        self.s.push(NS(voice_activity=NS(voice_activity_type="ACTIVITY_START")))
+        await self.settle()
+        for _ in range(4):
+            await self.b.feed_audio(voice)
+        await asyncio.sleep(gemini_live.VA_CONFIRM_S + 0.15)
+        self.assertEqual(len(self.dicts("live_stop")), 1)
+        await self.b.close()
+
+    async def test_status_gets_words_that_arrive_after_the_tool_call(self):
+        # get_status uses THIS turn's words even when they arrive after Gemini's tool call (never "").
+        await self.make()
+        self.s.push(call("get_status", {}))
+        await self.settle()
+        self.s.push(heard("check my tasks"))
+        await asyncio.sleep(0.1)
+        await self.settle()
+        if self.b.tool_task:
+            await self.b.tool_task
+        self.assertEqual(self.tools.status_queries[-1], "check my tasks")
+        await self.b.close()
+
+    async def test_echo_words_do_not_stop_dot(self):
+        await self.make()
+        self.s.push(said("Your next showing is at three."))
+        self.s.push(audio(b"\x01" * 96000))
+        self.s.push(done())
+        await self.settle()
+        self.s.push(heard("showing is at three"))   # her mic hears Dot
+        await self.settle()
+        self.assertFalse(self.dicts("live_stop"))
+        await self.b.close()
+
+    async def test_vad_config_keeps_pauses(self):
+        # R3: low sensitivity and a long enough silence so a pause mid-sentence does not end her turn.
+        await self.make()
+        aad = self.configs[0].realtime_input_config.automatic_activity_detection
+        self.assertGreaterEqual(aad.silence_duration_ms, 700)
+        self.assertIn("LOW", str(aad.end_of_speech_sensitivity))
+        self.assertNotIn("LOW", str(aad.start_of_speech_sensitivity))   # low start: Gemini heard nothing (real API)
+        self.assertGreaterEqual(self.configs[0].context_window_compression.trigger_tokens, 16000)
+        await self.b.close()
+
+    async def test_hand_off_audio_has_no_dot_tail(self):
+        # The turn audio for Whisper starts when Dot's playback ends, not at her turn_complete (no Dot echo).
+        await self.make()
+        self.s.push(audio(b"\x01" * 96000))
+        self.s.push(done())
+        await self.settle()
+        await self.b.feed_audio(b"\x05\x00" * 16000)   # 1 s of mic while Dot's tail plays
+        self.assertLessEqual(len(self.b._turn_buf), gemini_live.RECENT_BYTES)
+        await self.b.close()
+
+    async def test_her_voice_level_marks_speaking(self):
+        # R8: even with no voice-activity event, her voice makes Dot busy (no session update over her).
+        await self.make()
+        loud = (b"\x00\x30" * 1600)   # 0.1 s of loud audio
+        for _ in range(4):
+            await self.b.feed_audio(loud)
+        self.assertTrue(self.b.user_speaking)
+        self.assertTrue(self.b.busy)
+        await self.b.close()
+
     async def test_barge_in_words_start_next_turn(self):
         await self.make()
         self.s.push(heard("first question"))
         self.s.push(audio(b"\x01"))
         self.s.push(NS(voice_activity=NS(voice_activity_type="ACTIVITY_START")))
+        self.s.push(content(interrupted=True))   # the service interrupts at her voice; her words come after
         self.s.push(heard("wait stop"))
-        self.s.push(content(interrupted=True))
         self.s.push(heard(" and call Alex"))
         self.s.push(audio(b"\x02"))
         await self.settle()

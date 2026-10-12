@@ -380,8 +380,13 @@ class LiveBridge:
             if str(out).startswith("posted"):
                 self.handoff_count += 1
             return out
-        elif name == "get_status":   # the model picks the session; no wait for exact words
-            q = self._turn_transcript or self.last_heard or ""
+        elif name == "get_status":   # the model picks the session; her words only help pick it
+            if not self._turn_transcript and not self._transcript_done.is_set():
+                try:   # her words of THIS turn may still be on their way (never the last turn's words)
+                    await asyncio.wait_for(self._transcript_done.wait(), timeout=1.5)
+                except (asyncio.TimeoutError, Exception):
+                    pass
+            q = self._turn_transcript or ""
             return await self.tools_impl.status(q, session=args.get("session"))
         elif name == "lookup":   # the model's question (it understood the audio) plus the heard words (exact names)
             q = " ".join(x for x in ((args.get("question") or "").strip(), (self._turn_transcript or "").strip()) if x)

@@ -58,6 +58,7 @@ class Tools:
 
     async def status(self, q, session=None):
         self.status_sessions = getattr(self, "status_sessions", []) + [session]
+        self.status_queries = getattr(self, "status_queries", []) + [q]
         return "all quiet"
 
     async def lookup(self, q):

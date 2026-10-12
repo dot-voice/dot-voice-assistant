@@ -469,24 +469,24 @@ class Call:
                     items = await asyncio.to_thread(updates.pending, self.svc.updates_folder)
                     if items:
                         path, rec = items[0]
-                        await asyncio.to_thread(updates.mark_spoken, path)
-                        line = updates.spoken_line(rec)
-                        log_line("update spoken from %s" % rec.get("from"), self.svc.turn_log)
-                        self.task = asyncio.create_task(self._say_update(line))
+                        self.task = asyncio.create_task(self._say_update(updates.spoken_line(rec), path, rec))
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log_exception("updates loop")
             await asyncio.sleep(3)
 
-    async def _say_update(self, line):
+    async def _say_update(self, line, path=None, rec=None):
         if self.live and getattr(self.live, "busy", False):
-            return
+            return   # still pending: the loop tries again when Dot is quiet (never lost)
+        if path:
+            await asyncio.to_thread(updates.mark_spoken, path)
+            log_line("update spoken from %s" % (rec or {}).get("from"), self.svc.turn_log)
         self.history.append({"role": "assistant", "text": line})
-        await self.send({"type": "transcript", "role": "assistant", "text": line})
-        if self.live:
+        if self.live:   # Live shows Dot's words itself (live_said): one bubble, not two
             await self.live.say_exact(line)
         else:
+            await self.send({"type": "transcript", "role": "assistant", "text": line})
             await self.speak(line)
 
     async def _keepalive(self):
@@ -578,6 +578,9 @@ class Call:
                                 await self.live.close()
                                 self.live = None
                                 log_line("live: off", self.svc.turn_log)
+                    elif kind == "barge":   # Live: the phone heard her over Dot and stopped playing
+                        if self.live and hasattr(self.live, "barge"):
+                            await self.live.barge()
                     elif kind == "interrupt":
                         await self.cancel_turn()
                         if self.live:
@@ -891,9 +894,8 @@ def fake_services(args):
     svc = Services(FakeSpeechToText("words from mic"), SlowFakeFrontDesk(delay), FakeTextToSpeech(), FakeHandoff(),
                    PinGuard(pin))
 
-    async def no_live(url, **kw):   # never reach Qwen from the harness: Live fails and the page must fall back
-        raise ConnectionRefusedError("fake mode: no Live provider")
-    svc.live_connect = no_live
+    import fake_live   # a stand-in Live session (no network); Qwen Live is always refused, so fallbacks are real
+    svc.live_connect = fake_live.fake_connect
     return svc
 
 

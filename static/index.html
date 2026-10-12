@@ -185,6 +185,9 @@ let workletBlobUrl = null;
 let liveOk = false;
 let liveDropAudio = false, liveSilenceTimer = null;
 let micSrc = null, keepAliveSrc = null;
+let liveGain = null, liveSpeakStart = 0, liveFloor = 0.01, liveLoudMs = 0, livePlayFloor = 0, livePlayCap = 0.02;   // Live playback + her voice over Dot
+let rsTail = new Float32Array(0), rsPos = 0;   // Live mic resampler state (carries across frames)
+const LIVE_BARGE_MS = 300, LIVE_ECHO_GRACE_MS = 800;
 let tapToListen = false, modeRunningBeforeLive = null;
 
 const $ = id => document.getElementById(id);
@@ -319,11 +322,7 @@ function onMessage(m) {
     setState("listening");
   }
   else if (m.type === "live_audio") {
-    if (liveDropAudio) {
-      clearTimeout(liveSilenceTimer);
-      liveSilenceTimer = setTimeout(() => { liveDropAudio = false; }, 300);
-      return;
-    }
+    if (liveDropAudio) return;   // the stopped reply's last pieces; a fixed 300 ms window, so a new reply is never swallowed
     playLiveAudioChunk(m.b64);
   }
   else if (m.type === "live_stop") {
@@ -474,7 +473,10 @@ function setEarsButton() {
 }
 function getAudioCtx() {
   const AC = window.AudioContext || window.webkitAudioContext;
-  if (!ctx || ctx.state === "closed") ctx = new AC();
+  if (!ctx || ctx.state === "closed") {
+    ctx = new AC();
+    ctx.onstatechange = () => { if (ctx && ctx.state === "interrupted") { wakeTries = 0; setTimeout(wakeAudio, 500); } };
+  }
   return ctx;
 }
 async function startAudioOnly() {
@@ -514,12 +516,16 @@ function playLiveAudioChunk(b64) {
     const buf = c.createBuffer(1, int16.length, 24000);
     const ch = buf.getChannelData(0);
     for (let i = 0; i < int16.length; i++) ch[i] = int16[i] / 32768.0;
+    const now = c.currentTime;
+    const fresh = liveNextTime <= now;   // after a gap: fade in over 5 ms (no click)
+    if (fresh) { const n = Math.min(120, ch.length); for (let i = 0; i < n; i++) ch[i] *= i / n; }
 
     const src = c.createBufferSource();
     src.buffer = buf;
-    src.connect(c.destination);
+    if (!liveGain || liveGain.context !== c) { liveGain = c.createGain(); liveGain.connect(c.destination); }
+    src.connect(liveGain);
+    if (!liveSources.length) { liveSpeakStart = performance.now(); livePlayCap = Math.max(0.02, livePlayFloor * 1.5); }
 
-    const now = c.currentTime;
     const startAt = Math.max(now, liveNextTime);
     src.start(startAt);
     liveNextTime = startAt + buf.duration;
@@ -539,8 +545,14 @@ function playLiveAudioChunk(b64) {
 }
 
 function stopLivePlayback() {
+  const g = liveGain, t = ctx ? ctx.currentTime : 0;
+  liveGain = null;   // the next reply gets a fresh node
+  if (g) {   // 30 ms fade-out instead of a hard cut (no click)
+    try { g.gain.cancelScheduledValues(t); g.gain.setValueAtTime(g.gain.value, t); g.gain.linearRampToValueAtTime(0, t + 0.03); } catch (e) {}
+    setTimeout(() => { try { g.disconnect(); } catch (e) {} }, 120);
+  }
   liveSources.forEach(s => {
-    try { s.onended = null; s.stop(); } catch (e) {}
+    try { s.onended = null; s.stop(g ? t + 0.035 : 0); } catch (e) {}
   });
   liveSources = [];
   liveNextTime = 0;
@@ -609,10 +621,35 @@ registerProcessor("tap", Tap);`;
 async function getMicStream() {
   const live = keptStream && keptStream.getAudioTracks().some(t => t.readyState === "live");
   if (!live) keptStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
-  keptStream.getAudioTracks().forEach(t => { t.enabled = true; });
+  keptStream.getAudioTracks().forEach(t => { t.enabled = true; t.onended = onMicEnded; });
   stream = keptStream;
   return stream;
 }
+
+// iOS ends the mic track after a phone call, Siri or the lock screen: rebuild it so Live never goes deaf.
+let micRebuild = null;   // one rebuild at a time: two pipelines would send every frame twice
+function onMicEnded() {
+  if (!inCall || micRebuild) return;
+  logEvent("mic:ended");
+  try { if (node) node.disconnect(); } catch (e) {}
+  try { if (micSrc) micSrc.disconnect(); } catch (e) {}
+  node = null; micSrc = null; keptStream = null;
+  if (!(liveMode || !earsPhone)) return;
+  micRebuild = setupMicCapture()
+    .catch(() => addChip("Microphone stopped. Tap here to turn it back on.", true, () => { setupMicCapture().catch(() => {}); }))
+    .finally(() => { micRebuild = null; });
+}
+let wakeTries = 0;
+function wakeAudio() {   // iOS suspends or "interrupts" the audio context in the background; resume it on return
+  if (!inCall || !ctx) return;
+  if (ctx.state !== "running" && ctx.state !== "closed") {
+    ctx.resume().catch(() => {});
+    if (ctx.state === "interrupted" && wakeTries++ < 20) setTimeout(wakeAudio, 1000);   // e.g. a phone call
+  } else wakeTries = 0;
+  if (keptStream && !keptStream.getAudioTracks().some(t => t.readyState === "live")) onMicEnded();
+}
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") wakeAudio(); });
+window.addEventListener("pageshow", wakeAudio);
 
 async function setupMicCapture() {
   if (node) return;
@@ -620,6 +657,7 @@ async function setupMicCapture() {
   const c = getAudioCtx();
   if (c.state === "suspended") await c.resume();
   const src = c.createMediaStreamSource(s);
+  micSrc = src;
 
   let captureNode = null;
   if (c.audioWorklet && window.AudioWorkletNode) {
@@ -679,15 +717,13 @@ function onLiveFrame(raw) {
     return;
   }
   const level = rms(raw);
-  if (!playing) {
-    const o = $("orb");
-    if (o) o.style.transform = orbScale(level);
-  }
+  if (!playing) setOrbLevel(level);
   if (muted) {
     liveAcc = []; liveAccLen = 0;
     return;
   }
-  const f32 = downsample(raw, ctx.sampleRate);
+  liveBargeCheck(level, raw.length / ctx.sampleRate * 1000);
+  const f32 = liveResample(raw, ctx.sampleRate);
   liveAcc.push(f32);
   liveAccLen += f32.length;
   while (liveAccLen >= LIVE_CHUNK_SAMPLES) {
@@ -719,6 +755,56 @@ function onLiveFrame(raw) {
   }
 }
 
+// Her voice over Dot's reply: stop playback here at once and tell the server (the service's own signal can be late
+// or missing). Echo guard: the mic level during Dot's sound is learned (livePlayFloor); her voice must be 3x that
+// (and clearly loud in Dot's first LIVE_ECHO_GRACE_MS, while it is still being learned) for LIVE_BARGE_MS.
+// The learned level may rise at most 1.5x per reply, so her own voice can never be learned as echo.
+function liveBargeCheck(level, frameMs) {
+  if (!liveSources.length) {
+    liveLoudMs = 0;
+    if (level < liveFloor * 2) liveFloor = Math.min(0.02, liveFloor * 0.98 + level * 0.02);
+    return;
+  }
+  let thr = Math.max(0.03, liveFloor * 4, livePlayFloor * 2.5);
+  if (performance.now() - liveSpeakStart < LIVE_ECHO_GRACE_MS) thr = Math.max(thr, 0.15);
+  const loud = level > thr;
+  // capped per reply: if she talks as Dot starts, her voice must not be learned as echo
+  if (!loud) { const a = Math.min(1, frameMs / 600); livePlayFloor = livePlayFloor * (1 - a) + Math.min(level, livePlayCap) * a; }
+  liveLoudMs = loud ? liveLoudMs + frameMs : Math.max(0, liveLoudMs - frameMs * 0.5);
+  if (liveLoudMs >= LIVE_BARGE_MS) {
+    liveLoudMs = 0;
+    logEvent("live:barge");
+    stopLivePlayback();
+    armLiveDrop();
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "barge" }));
+  }
+}
+// 48 kHz -> 16 kHz for Live: box-average each output sample (a low-pass, no aliasing) and carry the position across
+// frames, so there is no jump at every 128-sample frame edge.
+function liveResample(f32, inRate) {
+  if (inRate === TARGET_RATE) return f32;
+  const ratio = inRate / TARGET_RATE;
+  const buf = new Float32Array(rsTail.length + f32.length);
+  buf.set(rsTail); buf.set(f32, rsTail.length);
+  const out = new Float32Array(Math.max(0, Math.floor((buf.length - rsPos) / ratio)));
+  let pos = rsPos, n = 0;
+  while (n < out.length && pos + ratio <= buf.length) {
+    const a = Math.floor(pos), b = Math.max(a + 1, Math.floor(pos + ratio));
+    let sum = 0;
+    for (let i = a; i < b; i++) sum += buf[i];
+    out[n++] = sum / (b - a);
+    pos += ratio;
+  }
+  const keep = Math.floor(pos);
+  rsTail = buf.slice(keep); rsPos = pos - keep;
+  return n === out.length ? out : out.subarray(0, n);
+}
+let orbRaf = 0, orbPending = 0;
+function setOrbLevel(level) {   // at most once per screen frame (the mic gives ~375 frames a second)
+  orbPending = level;
+  if (orbRaf) return;
+  orbRaf = requestAnimationFrame(() => { orbRaf = 0; const o = $("orb"); if (o && !playing) o.style.transform = orbScale(orbPending); });
+}
 function downsample(f32, inRate) {
   if (inRate === TARGET_RATE) return f32;
   const ratio = inRate / TARGET_RATE, n = Math.floor(f32.length / ratio), out = new Float32Array(n);
@@ -741,7 +827,7 @@ function onFrame(raw) {
   const thr = Math.max(MIN_THRESHOLD, noiseFloor * 3) * factor;
   const loud = level > thr;
   lastLevel = level; lastThr = thr;
-  if (!playing) { const o = $("orb"); if (o) o.style.transform = orbScale(level); }
+  if (!playing) setOrbLevel(level);
   const nowT = Date.now();
   if (nowT - dbgAt > 400) { dbgAt = nowT; const d = $("dbg"); if (d) d.textContent = "mic " + level.toFixed(3) + " / need " + thr.toFixed(3) + " | sent " + sentN + " | ws " + (ws ? ws.readyState : "-") + " | " + lastMsg; }
   // Noise floor: follows quiet moments down quickly, creeps up slowly, and is capped so speech can never raise it much.
@@ -930,6 +1016,9 @@ async function setLive(on, thisCallOnly) {
   setLiveButton();
   setEarsButton();
   if (liveMode) {
+    liveOk = false;   // "Connecting" until the server says Live is up (never a false "Listening")
+    setState("connecting");
+    rsTail = new Float32Array(0); rsPos = 0;
     if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "live", on: true }));
     recogWant = false;
     stopRecog();
@@ -945,6 +1034,7 @@ async function setLive(on, thisCallOnly) {
     }
   } else {
     if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "live", on: false }));
+    if (serverState === "connecting" && ws && ws.readyState === 1) setState("listening");   // Live never came up
     stopLivePlayback();
     if (earsPhone) {
       try { if (node) node.disconnect(); } catch (e) {} node = null;
