@@ -389,9 +389,16 @@ class GeminiBridge(realtime.LiveBridge):
 
     async def _speech_started(self):
         if not self._in_turn:
-            # Dot is answering: Gemini decides if this is a barge-in (then it sends interrupted -> live_stop).
-            # Noise it ignores must not cut Dot off on the phone.
+            # She talks while Dot answers: stop Dot NOW (her requirement 2026-10-11: "when I interrupt, it stop
+            # talking"). Gemini sends a reply far ahead of playback, so its own interrupted often never comes.
             self._barge = True
+            if time.monotonic() < self._play_until or not self._out_q.empty() or self.response_active:
+                self._log_line("live: she interrupted, Dot stopped")
+                self._flush_audio()
+                self._drop_audio = True          # the rest of this reply, until its turn_complete
+                self._draining = time.monotonic()
+                self.response_active = False
+                await self.send_to_phone({"type": "live_stop"})
             return
         self._user_speaking = True
         self._activity_at = time.monotonic()
@@ -413,8 +420,10 @@ class GeminiBridge(realtime.LiveBridge):
                 self._activity_at = time.monotonic()
                 self.stopped_at = None
                 self._heard += it.text
+                await self.send_to_phone({"type": "live_partial", "text": self._heard.strip()})
             elif self._barge:   # she talks over Dot: these words start her next turn
                 self._barge_heard += it.text
+                await self.send_to_phone({"type": "live_partial", "text": self._barge_heard.strip()})
             else:   # late words for the turn that just ended
                 self._heard += it.text
                 self._turn_transcript = self.last_heard = self._heard.strip()

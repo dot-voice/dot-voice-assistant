@@ -142,6 +142,7 @@ class GeminiBridgeTest(unittest.IsolatedAsyncioTestCase):
         await self.settle()
         self.assertIn(b"\x01\x02", self.phone)
         self.assertEqual([m["text"] for m in self.dicts("live_heard")], ["hello there"])
+        self.assertEqual([m["text"] for m in self.dicts("live_partial")], ["hello", "hello there"])   # words while she talks
         self.assertEqual([m["text"] for m in self.dicts("live_said")], ["Hi."])
         self.assertIsNotNone(self.b.stopped_at)
         self.assertFalse(self.b.busy)
@@ -294,12 +295,20 @@ class GeminiBridgeTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.dicts("live_stop"))
         await self.b.close()
 
-    async def test_noise_during_reply_does_not_cut_dot_off(self):
+    async def test_she_interrupts_dot_stops(self):
+        # Requirement R2: when she talks over Dot, Dot stops at once, even if Gemini never sends interrupted.
         await self.make()
-        self.s.push(audio(b"\x01"))
+        self.s.push(audio(b"\x01" * 144000))   # 3 s reply
+        await self.settle()
+        sent = sum(len(m) for m in self.phone if isinstance(m, bytes))
         self.s.push(NS(voice_activity=NS(voice_activity_type="ACTIVITY_START")))
         await self.settle()
-        self.assertFalse(self.dicts("live_stop"))
+        self.assertEqual(len(self.dicts("live_stop")), 1)
+        self.s.push(audio(b"\x02" * 9600))     # Gemini keeps generating the old reply
+        await self.settle()
+        await asyncio.sleep(0.3)
+        self.assertEqual(sum(len(m) for m in self.phone if isinstance(m, bytes)), sent)
+        self.assertNotIn(b"\x02" * 9600, self.phone)
         await self.b.close()
 
     async def test_barge_in_words_start_next_turn(self):

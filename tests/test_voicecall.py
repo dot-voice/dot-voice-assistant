@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -689,6 +690,25 @@ class TestRepoRules(unittest.TestCase):
             text = open(os.path.join(ROOT, f)).read().lower()
             for banned in ("gemini", "groq", "doubao", "speech.googleapis", "api.openai.com", "deepgram", "assemblyai"):
                 self.assertNotIn(banned, text.replace("no audio", ""), "%s mentions %s" % (f, banned))
+
+
+
+class TestPageLook(unittest.TestCase):
+    def setUp(self):
+        self.page = open(os.path.join(ROOT, "static", "index.html")).read()
+
+    def test_page_avatar_portrait_and_calm_breathing(self):
+        self.assertIn('const LOOKS = ["/dot/dot-portrait.jpg"', self.page)
+        m = re.search(r"#orb\.speaking \{ animation:speak ([0-9.]+)s", self.page)
+        self.assertGreaterEqual(float(m.group(1)), 2.0)   # a slow breath, not a shake
+        m = re.search(r"@keyframes speak \{.*?50% \{ scale:([0-9.]+);", self.page)
+        self.assertLessEqual(float(m.group(1)), 1.04)
+        self.assertNotIn("glow .8s", self.page)
+        self.assertIn("Math.min(0.05", self.page)   # her voice moves the face at most 5%
+
+    def test_page_shows_live_words_and_stops_on_interrupt(self):
+        self.assertIn('m.type === "live_partial") showLive(', self.page)
+        self.assertRegex(self.page, r'm\.type === "live_stop"\) \{\s*stopLivePlayback\(\)')
 
 
 if __name__ == "__main__":

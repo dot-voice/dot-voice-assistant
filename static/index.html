@@ -330,8 +330,10 @@ function onMessage(m) {
     stopLivePlayback();
     armLiveDrop();
   }
-  else if (m.type === "live_heard") { if (m.text) addMsg("user", m.text); }
+  else if (m.type === "live_partial") showLive(m.text || "");   // her words while she is still talking (Live)
+  else if (m.type === "live_heard") { showLive(""); if (m.text) addMsg("user", m.text); }
   else if (m.type === "live_said") {
+    showLive("");
     clearTimeout(liveSilenceTimer);
     liveDropAudio = false;
     if (m.text) addMsg("assistant", m.text);
