@@ -14,6 +14,8 @@ KEYCHAIN = "voice-call-gemini"
 DEFAULT_MODEL = "gemini-3.8-live"
 DEFAULT_VOICE = "Iapetus"
 TURN_CAP = 960000   # 30 s of 16 kHz pcm16
+PIECE = 9600        # 0.2 s of 24 kHz pcm16 per phone message
+AHEAD_S = 1.0       # keep at most this much audio queued on the phone
 QUOTA_WORDS = ("429", "resource_exhausted", "resource exhausted", "quota", "rate limit")
 QUOTA_PAUSE_S = 3600   # free quota used up: Qwen for an hour, then try Gemini again
 
@@ -86,14 +88,19 @@ class GeminiBridge(realtime.LiveBridge):
         self._resumes = []           # times of recent resumes (cap)
         self._resume_lock = asyncio.Lock()
         self._seeded = False
-        self._play_until = 0.0       # when the phone finishes playing what was sent (Gemini sends faster than real time)
+        self._play_until = 0.0       # when the phone finishes playing what was sent
+        # Gemini sends a whole reply in about a second; the phone got scratchy on such bursts, so audio
+        # is paced out at speaking speed like Qwen's stream.
+        self._out_q = asyncio.Queue()
+        self._out_gen = 0
+        self._out_task = None
         self._turn_started = 0.0
 
     @property
     def busy(self):
         now = time.monotonic()
         draining = bool(self._draining and now - self._draining < 8.0)
-        return bool(super().busy or draining or now < self._play_until)
+        return bool(super().busy or draining or now < self._play_until or not self._out_q.empty())
 
     @property
     def user_speaking(self):
@@ -129,7 +136,29 @@ class GeminiBridge(realtime.LiveBridge):
             _note_quota(e)
             raise
         self.ws = self.session   # LiveBridge._fail closes self.ws
+        self._out_task = asyncio.ensure_future(self._playout())
         self.reader = asyncio.ensure_future(self._read_loop())
+
+    def _flush_audio(self):
+        self._out_gen += 1   # queued pieces of the old reply are skipped
+        self._play_until = 0.0
+
+    async def _playout(self):
+        while not self.closed:
+            gen, piece = await self._out_q.get()
+            if gen != self._out_gen or self._drop_audio:
+                continue
+            ahead = self._play_until - time.monotonic()
+            if ahead > AHEAD_S:
+                await asyncio.sleep(ahead - AHEAD_S)
+                if gen != self._out_gen or self._drop_audio or self.closed:
+                    continue
+            now = time.monotonic()
+            self._play_until = max(now, self._play_until) + len(piece) / 48000.0
+            try:
+                await self.send_to_phone(piece)
+            except Exception:
+                pass
 
     async def _reconnect(self, old=None):
         """GoAway (about every 10 min) or a dropped socket: resume the same conversation on a new connection.
@@ -177,6 +206,8 @@ class GeminiBridge(realtime.LiveBridge):
     async def _fail(self, reason):
         if _note_quota(reason):
             self._log_line("live: gemini quota used up, Qwen for the next hour")
+        if self._out_task and self._out_task is not asyncio.current_task():
+            self._out_task.cancel()
         await super()._fail(reason)
 
     async def close(self):
@@ -186,6 +217,8 @@ class GeminiBridge(realtime.LiveBridge):
         self.closed = True
         if self.reader and self.reader is not asyncio.current_task():
             self.reader.cancel()
+        if self._out_task and self._out_task is not asyncio.current_task():
+            self._out_task.cancel()
         if self.tool_task and self.tool_task is not asyncio.current_task():
             self.tool_task.cancel()
         if self.session is not None:
@@ -235,7 +268,7 @@ class GeminiBridge(realtime.LiveBridge):
 
     async def cancel(self):
         # No cancel in the Live API: drop the rest of this reply (same effect for her as a barge-in).
-        self._play_until = 0.0
+        self._flush_audio()
         if self.response_active:
             self._drop_audio = True
             self._draining = time.monotonic()
@@ -365,7 +398,7 @@ class GeminiBridge(realtime.LiveBridge):
         self.stopped_at = None
         if self._activity_at < self._play_until:
             # Gemini finished the reply but the phone is still playing its tail: stop it, she is talking.
-            self._play_until = 0.0
+            self._flush_audio()
             await self.send_to_phone({"type": "live_stop"})
 
     async def _on_content(self, sc):
@@ -389,7 +422,7 @@ class GeminiBridge(realtime.LiveBridge):
                     self._turn_words = self._turn_transcript
                 self._transcript_done.set()
         if sc.interrupted:
-            self._play_until = 0.0
+            self._flush_audio()
             await self._send_heard()
             self._start_turn()
             self._user_speaking = True
@@ -402,9 +435,9 @@ class GeminiBridge(realtime.LiveBridge):
                 if data:
                     await self._end_turn()
                     if not self._drop_audio:
-                        now = time.monotonic()
-                        self._play_until = max(now, self._play_until) + len(data) / 48000.0
-                        await self.send_to_phone(bytes(data))
+                        data = bytes(data)
+                        for i in range(0, len(data), PIECE):
+                            self._out_q.put_nowait((self._out_gen, data[i:i + PIECE]))
         ot = getattr(sc, "output_transcription", None)
         if ot is not None and ot.text:
             await self._end_turn()

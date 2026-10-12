@@ -147,6 +147,19 @@ class GeminiBridgeTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.b.busy)
         await self.b.close()
 
+    async def test_reply_paced_to_phone(self):
+        await self.make()
+        self.s.push(audio(b"\x01" * 144000))   # 3 s of reply arriving at once
+        await self.settle()
+        sent = sum(len(m) for m in self.phone if isinstance(m, bytes))
+        self.assertLessEqual(sent / 48000.0, gemini_live.AHEAD_S + 0.25)
+        self.assertTrue(all(len(m) <= gemini_live.PIECE for m in self.phone if isinstance(m, bytes)))
+        self.s.push(content(interrupted=True))
+        await self.settle()
+        await asyncio.sleep(0.3)
+        self.assertEqual(sum(len(m) for m in self.phone if isinstance(m, bytes)), sent)   # the rest is dropped
+        await self.b.close()
+
     async def test_interrupted_stops_phone(self):
         await self.make()
         self.s.push(audio(b"\x01"))

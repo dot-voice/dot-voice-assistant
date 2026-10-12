@@ -58,11 +58,11 @@
   #orb.listening::before { opacity:.9; }
   #orb.thinking::before, #orb.working::before { opacity:1; animation:spin 1.4s linear infinite; }
   #orb.thinking img, #orb.working img { animation:tilt 2.4s ease-in-out infinite; }
-  #orb.speaking::before { opacity:1; animation:spin 3s linear infinite, glow .8s ease-in-out infinite; }
-  #orb.speaking { animation:speak .8s ease-in-out infinite; }
+  #orb.speaking::before { opacity:1; animation:spin 6s linear infinite; }
+  #orb.speaking { animation:speak 3.2s ease-in-out infinite; }   /* a calm breath while Dot talks, not a shake */
   #orb:not(.listening):not(.thinking):not(.working):not(.speaking) img { filter:grayscale(.7) brightness(.7); }
   @keyframes breathe { 0%,100% { scale:1; } 50% { scale:1.04; } }
-  @keyframes speak { 0%,100% { scale:1; } 50% { scale:1.06; } }
+  @keyframes speak { 0%,100% { scale:1; } 50% { scale:1.035; } }
   @keyframes spin { to { transform:rotate(360deg); } }
   @keyframes glow { 0%,100% { filter:blur(0); } 50% { filter:blur(4px); } }
   @keyframes tilt { 0%,100% { transform:rotate(0); } 30% { transform:rotate(-4deg); } 70% { transform:rotate(4deg); } }
@@ -98,7 +98,7 @@
 <!-- A real form with username + current-password lets iOS save the PIN in iCloud Keychain and fill it with Face ID.
     The server still checks the PIN; nothing about auth changed. -->
 <form id="login" action="#" method="post" autocomplete="on">
-  <div class="face big" id="loginFace"><img src="/dot/dot-real.jpg" alt="Dot" onerror="this.classList.add('gone');if(this.parentNode)this.parentNode.classList.add('noimg');"></div>
+  <div class="face big" id="loginFace"><img src="/dot/dot-portrait.jpg" alt="Dot" onerror="this.classList.add('gone');if(this.parentNode)this.parentNode.classList.add('noimg');"></div>
   <p>Hi @@OWNER@@, it's @@ASSISTANT@@. Enter your PIN to talk.</p>
   <input id="user" name="username" type="text" autocomplete="username" value="@@USER@@" readonly style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0" tabindex="-1" aria-hidden="true">
   <input id="pin" name="password" type="password" inputmode="numeric" autocomplete="current-password" maxlength="12" placeholder="&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;">
@@ -107,7 +107,7 @@
 </form>
 
 <section id="call" class="hidden">
-  <div id="top"><div class="face" id="orb" title="Tap to change Dot's look"><img id="dotImg" src="/dot/dot-real.jpg" alt="Dot" onerror="this.classList.add('gone');if(this.parentNode)this.parentNode.classList.add('noimg');"></div>
+  <div id="top"><div class="face" id="orb" title="Tap to change Dot's look"><img id="dotImg" src="/dot/dot-portrait.jpg" alt="Dot" onerror="this.classList.add('gone');if(this.parentNode)this.parentNode.classList.add('noimg');"></div>
     <div id="who"><div id="name">Dot</div><div id="state"></div></div>
     <button id="toBtn" type="button" aria-label="Choose who you talk to">&#9776; <span id="toLbl">Auto</span></button></div>
   <div id="toMenu" class="hidden"><div id="toList"></div></div>
@@ -679,7 +679,7 @@ function onLiveFrame(raw) {
   const level = rms(raw);
   if (!playing) {
     const o = $("orb");
-    if (o) o.style.transform = "scale(" + (1 + Math.min(0.35, level * 4)).toFixed(3) + ")";
+    if (o) o.style.transform = orbScale(level);
   }
   if (muted) {
     liveAcc = []; liveAccLen = 0;
@@ -739,7 +739,7 @@ function onFrame(raw) {
   const thr = Math.max(MIN_THRESHOLD, noiseFloor * 3) * factor;
   const loud = level > thr;
   lastLevel = level; lastThr = thr;
-  if (!playing) { const o = $("orb"); if (o) o.style.transform = "scale(" + (1 + Math.min(0.35, level * 4)).toFixed(3) + ")"; }
+  if (!playing) { const o = $("orb"); if (o) o.style.transform = orbScale(level); }
   const nowT = Date.now();
   if (nowT - dbgAt > 400) { dbgAt = nowT; const d = $("dbg"); if (d) d.textContent = "mic " + level.toFixed(3) + " / need " + thr.toFixed(3) + " | sent " + sentN + " | ws " + (ws ? ws.readyState : "-") + " | " + lastMsg; }
   // Noise floor: follows quiet moments down quickly, creeps up slowly, and is capped so speech can never raise it much.
@@ -973,7 +973,12 @@ $("langBtn").onclick = () => {
   render();
 };
 $("stopTalk").onclick = () => { if (inCall) { lastSent = ""; interrupt(); } };   // Skip drops the words too
-const LOOKS = ["/dot/dot-real.jpg", "/dot/dot-cartoon.jpg"];
+let orbLevel = 0;
+function orbScale(level) {   // follows her voice gently: smoothed and small, so the face never jitters
+  orbLevel = orbLevel * 0.85 + Math.min(0.05, level * 0.6) * 0.15;
+  return "scale(" + (1 + orbLevel).toFixed(3) + ")";
+}
+const LOOKS = ["/dot/dot-portrait.jpg", "/dot/dot-real.jpg", "/dot/dot-cartoon.jpg"];
 function faceImg(img, src) {
   if (!img) return;
   const box = img.parentNode;
@@ -986,6 +991,7 @@ function faceImg(img, src) {
   }
 }
 function setLook(i) { const src = LOOKS[(i + LOOKS.length) % LOOKS.length]; faceImg($("dotImg"), src); faceImg($("loginFace").querySelector("img"), src); }
+if (load("lookPortrait") !== "1") { store("lookPortrait", "1"); store("dotLook", "0"); }   // the new portrait first, once
 let look = parseInt(load("dotLook") || "0", 10) || 0; setLook(look);
 $("orb").onclick = () => { look = (look + 1) % LOOKS.length; store("dotLook", String(look)); setLook(look); };
 // ---------------------------------------------------------------- who the caller talks to (menu at the top)
