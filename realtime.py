@@ -41,8 +41,9 @@ def build_tools():
          "description": "Pass real work or a request to the right agent session.",
          "parameters": {"type": "object", "properties": {"agent": agent}, "required": []}},
         {"type": "function", "name": "get_status",
-         "description": "Get the current status of the agent sessions.",
-         "parameters": {"type": "object", "properties": {}}},
+         "description": "Status, tasks, progress or updates of the agent sessions. Pass session when one is named; "
+                        "leave it out for all of them.",
+         "parameters": {"type": "object", "properties": {"session": dict(agent, description="The one session asked about, if any.")}}},
         {"type": "function", "name": "lookup",
          "description": "Look up weather, time, notes, rules, people, properties, or past decisions.",
          "parameters": {"type": "object", "properties": {"question": {"type": "string", "description": "What to look up."}}, "required": ["question"]}},
@@ -93,6 +94,7 @@ class LiveBridge:
         self._in_turn = False
         self._turn_transcript = None
         self._turn_words = None
+        self._whisper_words = None
 
         # State tracking
         self._user_speaking = False
@@ -257,6 +259,7 @@ class LiveBridge:
             self._transcript_done.clear()
             self._turn_transcript = None
             self._turn_words = None
+            self._whisper_words = None
             self.turn_pcm = b""
             self._turn_buf = bytearray(self._preroll)
             self._in_turn = True
@@ -299,28 +302,30 @@ class LiveBridge:
                 await self._fail(err_msg)
 
     async def _get_turn_words(self):
-        if self._turn_words is not None:
-            return self._turn_words
-        if not self._transcript_done.is_set():   # Qwen's own transcript first; Whisper only if it is late
-            try:
-                await asyncio.wait_for(self._transcript_done.wait(), timeout=2.5 if self.transcribe is None else self.transcript_wait_s)
-            except (asyncio.TimeoutError, Exception):
-                self._log_line("live transcript late, using Whisper")
-        words = self._turn_transcript
+        """Her exact words for a hand-off. Local Whisper of the turn audio first: Qwen's separate ASR sometimes
+        returns the wrong language. Qwen's
+        transcript is the fallback when Whisper is missing or hears nothing."""
+        if self._whisper_words is not None:
+            return self._whisper_words
         pcm = self.turn_pcm or (bytes(self._turn_buf) if self._turn_buf else b"")
-        if not words and self.transcribe is not None:
+        if self.transcribe is not None:
             try:
-                words = await asyncio.to_thread(self.transcribe, pcm)
-                words = str(words or "").strip()
-                if words:
-                    self.last_heard = words
-                    self._turn_words = words
-                    await self.send_to_phone({"type": "live_heard", "text": words})
+                words = str(await asyncio.to_thread(self.transcribe, pcm) or "").strip()
             except Exception:
                 words = ""
-        elif words:
-            self.last_heard = words
-            self._turn_words = words
+            if words:
+                self._whisper_words = self.last_heard = self._turn_words = words
+                await self.send_to_phone({"type": "live_heard", "text": words})
+                return words
+        if not self._transcript_done.is_set():
+            try:
+                await asyncio.wait_for(self._transcript_done.wait(),
+                                       timeout=2.5 if self.transcribe is None else self.transcript_wait_s)
+            except (asyncio.TimeoutError, Exception):
+                self._log_line("live: no words (Whisper empty, Qwen transcript late)")
+        words = self._turn_transcript
+        if words:
+            self.last_heard = self._turn_words = words
         return self._turn_words or ""
 
     def _log_line(self, text):
@@ -355,12 +360,13 @@ class LiveBridge:
             if str(out).startswith("posted"):
                 self.handoff_count += 1
             return out
-        elif name == "get_status":
-            words = await self._get_turn_words()
-            return await self.tools_impl.status(words or self.last_heard)
-        elif name == "lookup":
-            words = await self._get_turn_words()
-            q = words if (words and len(words) >= 2) else (args.get("question") or "")
+        elif name == "get_status":   # the model picks the session; no wait for exact words
+            q = self._turn_transcript or self.last_heard or ""
+            return await self.tools_impl.status(q, session=args.get("session"))
+        elif name == "lookup":   # the model's question (it understood the audio) plus the heard words (exact names)
+            q = " ".join(x for x in ((args.get("question") or "").strip(), (self._turn_transcript or "").strip()) if x)
+            if len(q) < 2:
+                q = await self._get_turn_words()
             lookup_fn = getattr(self.tools_impl, "lookup", None)
             if lookup_fn:
                 return await lookup_fn(q)

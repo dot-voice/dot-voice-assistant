@@ -220,6 +220,16 @@ def direct_status(text, folder=None, now=None, updates_fn=None, titles=None):
         return overview(folder, now, titles)
     if not role or role in PRIVATE_ROLES:
         return None
+    return session_status(role, folder, now, updates_fn, titles)
+
+
+def session_status(role, folder=None, now=None, updates_fn=None, titles=None):
+    """One session's saved next step and its last update, in its own words. No phrase rules: the caller picks the role."""
+    folder = folder or CARRYOVER
+    now = now or time.time()
+    titles = session_titles() if titles is None else titles
+    if role in PRIVATE_ROLES:
+        return None
     name = titles.get(role, role)
     parts = []
     try:

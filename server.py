@@ -187,18 +187,21 @@ class LiveTools:
         reason = (rec.get("post_error") if rec else "") or "failed to post"
         return "not sent: %s" % reason
 
-    async def status(self, question):
+    async def status(self, question, session=None):
+        """The model decides what is asked (no phrase rules): a named session gets its own status, else all sessions."""
+        import status as status_mod
+        res = None
         try:
-            res = await asyncio.to_thread(direct_status, question)
-        except Exception:
-            res = None
-        if not res:   # the model asked for status but the phrase matched no rule ("check my tasks"): all sessions
-            try:
-                import status as status_mod
+            role = session if session in TARGET_KEYS and session != "AUTO" else None
+            if not role:   # the model left session out but a name was said ("how is the CRM going")
+                role = status_mod.named_session(question)
+            if role:
+                res = await asyncio.to_thread(status_mod.session_status, role)
+            if not res:
                 res = await asyncio.to_thread(status_mod.overview, status_mod.CARRYOVER, time.time(),
                                               status_mod.session_titles())
-            except Exception:
-                res = None
+        except Exception:
+            res = None
         if res:
             return str(res).strip()
         return "No saved status for that."

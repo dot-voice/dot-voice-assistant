@@ -56,7 +56,8 @@ class Tools:
         self.calls.append((words, agent))
         return "posted to CRM"
 
-    async def status(self, q):
+    async def status(self, q, session=None):
+        self.status_sessions = getattr(self, "status_sessions", []) + [session]
         return "all quiet"
 
     async def lookup(self, q):
@@ -195,11 +196,11 @@ class LiveBridgeTest(unittest.IsolatedAsyncioTestCase):
         await self.make()
         self.ws.push({"type": "conversation.item.input_audio_transcription.completed", "transcript": "what is the weather in London"})
         self.ws.push({"type": "response.function_call_arguments.done", "name": "lookup", "call_id": "c_look",
-                      "arguments": json.dumps({"question": "IGNORE ARGUMENT"})})
+                      "arguments": json.dumps({"question": "weather London"})})
         await self.settle()
-        self.assertEqual(self.tools.lookups, ["what is the weather in London"])
+        self.assertEqual(self.tools.lookups, ["weather London what is the weather in London"])
         out = [e for e in self.ws.sent if e.get("item", {}).get("type") == "function_call_output"]
-        self.assertEqual(out[0]["item"]["output"], "lookup result: what is the weather in London")
+        self.assertEqual(out[0]["item"]["output"], "lookup result: weather London what is the weather in London")
         self.assertEqual(out[0]["item"]["call_id"], "c_look")
         await self.b.close()
 
@@ -226,6 +227,28 @@ class LiveBridgeTest(unittest.IsolatedAsyncioTestCase):
         out = [e for e in self.ws.sent if e.get("item", {}).get("type") == "function_call_output"]
         self.assertEqual(out[0]["item"]["call_id"], "c_bt")
         self.assertNotIn({"type": "response.create"}, self.ws.sent)
+        await self.b.close()
+
+    async def test_hand_off_prefers_whisper_over_qwen_transcript(self):
+        fake_transcribe = mock.Mock(return_value="is anything stuck")
+        await self.make(transcribe=fake_transcribe)
+        self.ws.push({"type": "input_audio_buffer.speech_started"})
+        self.ws.push({"type": "input_audio_buffer.speech_stopped"})
+        self.ws.push({"type": "conversation.item.input_audio_transcription.completed", "transcript": "wrong language"})
+        self.ws.push({"type": "response.function_call_arguments.done", "name": "hand_off", "call_id": "c_w",
+                      "arguments": json.dumps({"agent": "ORG"})})
+        await self.settle()
+        await asyncio.sleep(0.05)
+        self.assertEqual(self.tools.calls, [("is anything stuck", "ORG")])
+        await self.b.close()
+
+    async def test_get_status_passes_the_models_session(self):
+        await self.make()
+        self.ws.push({"type": "conversation.item.input_audio_transcription.completed", "transcript": "how is crm"})
+        self.ws.push({"type": "response.function_call_arguments.done", "name": "get_status", "call_id": "c_gs",
+                      "arguments": json.dumps({"session": "CRM"})})
+        await self.settle()
+        self.assertEqual(self.tools.status_sessions, ["CRM"])
         await self.b.close()
 
     async def test_tool_timeout_output_timed_out(self):
@@ -422,25 +445,22 @@ class ServerLiveTest(unittest.IsolatedAsyncioTestCase):
         res = await tools.hand_off("research area", "CRM")
         self.assertEqual(res, "limit reached, tell the caller to use the menu")
 
-    async def test_status_direct_status_and_fallback(self):
+    async def test_status_named_session_and_overview(self):
+        # 2026-10-11 her real call: "check my tasks" hit a phrase rule and got "No saved status". The model now
+        # picks the session; no phrase rules in the Live path.
         ws = FakeCallWS([])
         call = server.Call(ws, self.svc)
         tools = server.LiveTools(call)
-
-        with mock.patch("server.direct_status", return_value="CRM is updating leads"):
-            res = await tools.status("what is CRM doing")
-            self.assertEqual(res, "CRM is updating leads")
-
-        # 2026-10-11 her real call: "check my tasks" matched no status phrase and got "No saved status".
-        # The model only calls get_status for status questions, so an unmatched one gets the all-sessions overview.
-        with mock.patch("server.direct_status", return_value=None), \
-                mock.patch("status.overview", return_value="Latest from your sessions: CRM fixing notes"):
-            res = await tools.status("check my tasks")
-            self.assertEqual(res, "Latest from your sessions: CRM fixing notes")
-
-        with mock.patch("server.direct_status", return_value=None), mock.patch("status.overview", return_value=None):
-            res = await tools.status("check my tasks")
-            self.assertEqual(res, "No saved status for that.")
+        with mock.patch("status.session_status", return_value="CRM saved its notes at 21:00") as one, \
+                mock.patch("status.overview", return_value="Latest from your sessions: all") as allp:
+            self.assertEqual(await tools.status("how is the client list going", session="CRM"),
+                             "CRM saved its notes at 21:00")
+            one.assert_called_once_with("CRM")
+            for q in ("check my tasks", "any updates", "give me an update", "whats new", "is anything stuck"):
+                self.assertEqual(await tools.status(q), "Latest from your sessions: all")
+            self.assertEqual(await tools.status("x", session="AUTO"), "Latest from your sessions: all")
+        with mock.patch("status.session_status", return_value=None), mock.patch("status.overview", return_value=None):
+            self.assertEqual(await tools.status("check my tasks"), "No saved status for that.")
 
     async def test_live_tools_lookup(self):
         ws = FakeCallWS([])
