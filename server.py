@@ -232,8 +232,61 @@ class Call:
         self.bug_timer = None
         self.svc.last_call = self   # tests reach the live Call through this
 
-    def _on_live_closed(self):
-        self.live = None
+    def _on_live_closed(self, bridge=None):
+        if bridge is None or self.live is bridge:   # a replaced bridge closing late never ends its successor
+            self.live = None
+
+    async def _start_live(self, classes):
+        """Start the first Live provider that comes up (6 s each); raise the last failure."""
+        transcribe_fn = getattr(getattr(self.svc, "speech", None) or getattr(self.svc, "stt", None), "transcribe", None)
+        extra = {"connect": self.svc.live_connect} if getattr(self.svc, "live_connect", None) else {}
+        for i, cls in enumerate(classes):
+            holder = []
+            bridge = cls(
+                self._live_out,
+                LiveTools(self),
+                realtime.build_instructions(config.get("owner")),
+                transcribe=transcribe_fn,
+                on_closed=lambda h=holder: self._on_live_closed(h[0] if h else None),
+                turn_log=self.svc.turn_log,
+                **extra,
+            )
+            holder.append(bridge)
+            try:
+                await asyncio.wait_for(bridge.start(), 6)   # never block the call on a silent provider
+                if bridge.closed:   # died right after connecting (its live_error already went out)
+                    raise RuntimeError("closed at start")
+                return bridge
+            except BaseException as e:
+                try:
+                    await bridge.close()
+                except Exception:
+                    pass
+                if i == len(classes) - 1 or not isinstance(e, Exception):
+                    raise
+                log_line("live: %s failed (%s), next provider" % (cls.__name__, (str(e) or type(e).__name__)[:80]), self.svc.turn_log)
+
+    async def _live_to_qwen(self, failed):
+        """The first-choice Live provider died mid-call (quota, network): carry on in Qwen Live instead of dropping
+        her to classic mode."""
+        if not getattr(failed, "falls_back_to_qwen", False) or self.live_pending:
+            return False
+        self.live_pending = True
+        try:
+            self.live = await self._start_live([realtime.LiveBridge])
+        except Exception as e:
+            log_line("live: Qwen fallback failed (%s)" % (str(e) or type(e).__name__)[:80], self.svc.turn_log)
+            self.live = None
+            return False
+        finally:
+            self.live_pending = False
+        log_line("live: switched to Qwen mid-call", self.svc.turn_log)
+        await self.send({"type": "live_ok"})
+        try:   # her last words went to the dead provider
+            await self.live.say_exact("Sorry, I switched lines. Please say that again.")
+        except Exception:
+            pass
+        return True
 
     async def _live_out(self, item):
         if isinstance(item, bytes):
@@ -248,7 +301,9 @@ class Call:
         elif isinstance(item, dict):
             if item.get("type") == "live_error":
                 log_line("live: error %s" % str(item.get("text", ""))[:120], self.svc.turn_log)
-                self.live = None
+                failed, self.live = self.live, None
+                if await self._live_to_qwen(failed):
+                    return
             elif item.get("type") == "live_heard":
                 words = str(item.get("text", "")).strip()
                 if self.bug and words:
@@ -506,25 +561,7 @@ class Call:
                                 if self.live:
                                     await self.live.close()
                                     self.live = None
-                                transcribe_fn = getattr(getattr(self.svc, "speech", None) or getattr(self.svc, "stt", None), "transcribe", None)
-                                extra = {"connect": self.svc.live_connect} if getattr(self.svc, "live_connect", None) else {}
-                                bridge = realtime.LiveBridge(
-                                    self._live_out,
-                                    LiveTools(self),
-                                    realtime.build_instructions(config.get("owner")),
-                                    transcribe=transcribe_fn,
-                                    on_closed=self._on_live_closed,
-                                    turn_log=self.svc.turn_log,
-                                    **extra,
-                                )
-                                try:
-                                    await asyncio.wait_for(bridge.start(), 6)   # never block the call on a silent provider
-                                except BaseException:
-                                    try:
-                                        await bridge.close()
-                                    except Exception:
-                                        pass
-                                    raise
+                                bridge = await self._start_live(realtime.bridge_classes())
                                 self.live = bridge
                                 self.live_pending = False
                                 await self.send({"type": "live_ok"})

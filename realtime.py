@@ -64,6 +64,26 @@ def build_instructions(owner):
     )
 
 
+_DOWN_UNTIL = {}   # provider -> monotonic time it may be tried again (quota used up)
+
+
+def mark_down(provider, seconds):
+    _DOWN_UNTIL[provider] = time.monotonic() + seconds
+
+
+def bridge_classes():
+    """Live providers to try in order. live_provider "gemini": the second provider first, Qwen when it fails to start
+    or its free quota is used up (then Qwen only, until the pause ends)."""
+    if _cfg("live_provider") == "gemini" and _DOWN_UNTIL.get("gemini", 0) <= time.monotonic():
+        import gemini_live
+        return [gemini_live.GeminiBridge, LiveBridge]
+    return [LiveBridge]
+
+
+def bridge_class():
+    return bridge_classes()[0]
+
+
 class LiveBridge:
     def __init__(self, send_to_phone, tools_impl, instructions, model=None, connect=websockets.connect,
                  transcribe=None, on_closed=None, turn_log=None):

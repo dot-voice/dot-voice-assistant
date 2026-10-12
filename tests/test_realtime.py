@@ -173,6 +173,8 @@ class LiveBridgeTest(unittest.IsolatedAsyncioTestCase):
         self.ws.push({"type": "response.function_call_arguments.done", "name": "hand_off", "call_id": "c_wh",
                       "arguments": json.dumps({"agent": "CRM"})})
         await self.settle()
+        if self.b.tool_task:
+            await self.b.tool_task   # Whisper runs in a thread; settle() alone raced under a busy suite
         self.assertEqual(self.tools.calls, [("transcribed by whisper", "CRM")])
         fake_transcribe.assert_called_once()
         self.assertTrue(any(isinstance(p, dict) and p.get("type") == "live_heard" and p.get("text") == "transcribed by whisper" for p in self.phone))
