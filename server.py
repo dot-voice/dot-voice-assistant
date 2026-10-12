@@ -45,6 +45,26 @@ AUTH_TIMEOUT_S = 20
 BUG_TIMEOUT_S = 60
 RESUME_TTL_S = 12 * 3600   # a reconnect token lasts one working day
 RESUME_MAX = 10
+CALL_MEMORY_S = 30 * 60    # a dropped call's memory waits this long for the phone to come back
+HISTORY_MAX = 40           # lines kept per call
+SEED_LINES, SEED_CHARS = 20, 3000
+HANDOFF_HOLD_S = 6.0       # Live: a hand-off waits this long so "no, I meant CRM" can still correct it   # what a new Live session is told about the call so far
+
+
+class CallState:
+    """What one phone call remembers across reconnects (her ask 2026-10-12: after a network reconnect Dot must
+    not forget the call). Memory only: never logged, never written to disk, gone when the service restarts."""
+
+    def __init__(self):
+        self.history = []          # {"role", "text"} plus "turn" / "reply" tags from Live
+        self.handoff_count = 0
+        self.posted_handoffs = []
+        self.pending_handoff = None   # Live: the hand-off still in its correction window
+        self.notices = []             # lines Dot must say when she is quiet (a held hand-off that failed)
+        self.tag_base = 0             # each Live session numbers its lines from here (no clash across sessions)
+        self.tokens = set()        # every reconnect token issued in this call
+        self.call = None           # the Call using it now
+        self.last_used = time.time()
 PIN_FILE = os.path.join(HERE, "pin.txt")
 TURN_LOG = os.path.join(HERE, "logs", "turns.log")
 CALL_LOG_DIR = os.path.join(HERE, "logs", "calls")
@@ -134,6 +154,17 @@ class Services:
         self.updates_folder = updates.FOLDER
         self.live_connect = None          # tests/harness: replaces the Qwen realtime websocket connect
         self.resume = {}                  # reconnect tokens: token -> expiry. Memory only, gone when the service restarts.
+        self.call_states = []             # CallState per recent call (memory only)
+
+    def call_state(self, token):
+        """The memory of the call this reconnect token belongs to (any token issued in it), or None."""
+        now = time.time()
+        self.call_states = [st for st in self.call_states
+                            if st.call is not None or now - st.last_used < CALL_MEMORY_S][-RESUME_MAX:]
+        for st in self.call_states:
+            if any(hmac.compare_digest(t.encode(), token.encode()) for t in st.tokens):
+                return st
+        return None
 
     def issue_resume(self):
         """After a good sign-in the page gets a token for reconnects in the same call, so a dropped line does not ask
@@ -167,11 +198,57 @@ class LiveTools:
     def __init__(self, call):
         self.call = call
 
-    async def hand_off(self, words, agent):
+    async def hand_off(self, words, agent, replaces_waiting=False):
+        """Live: held HANDOFF_HOLD_S so she can correct it (her gap G4, 2026-10-12). A hand_off marked as her
+        correction replaces the waiting one (her correction is added to the words, the new session wins); any other
+        hand_off sends the waiting one first; cancel_hand_off drops it. Whatever still waits is sent at once when
+        the call or Live ends."""
         if getattr(self.call, "bug", None):
             return "not sent: this is a bug report, say only: noted"
+        st = self.call.state
+        p = st.pending_handoff
+        if p is not None and not replaces_waiting:
+            await self.post_pending(p)   # a new request, not a correction: both go out
+            p = None
+        if p is not None:
+            p["task"].cancel()
+            if words and words not in p["words"]:
+                p["words"] = (p["words"] + " " + words).strip()
+            p["agent"] = agent or p["agent"]
+            p["task"] = asyncio.create_task(self._post_later(p))
+            return "updated: the waiting hand-off now goes to %s" % (p["agent"] or "the right session")
         if getattr(self.call, "handoff_count", 0) >= 6:
             return "limit reached, tell the caller to use the menu"
+        p = {"words": words, "agent": agent}
+        p["task"] = asyncio.create_task(self._post_later(p))
+        st.pending_handoff = p
+        return "queued for %s, sent in a few seconds unless the caller corrects it" % (agent or "the right session")
+
+    async def cancel_hand_off(self):
+        p, self.call.state.pending_handoff = self.call.state.pending_handoff, None
+        if p is None:
+            return "nothing to cancel: the last hand-off was already sent"
+        p["task"].cancel()
+        log_line("live: hand-off cancelled before sending", self.call.svc.turn_log)
+        return "cancelled, nothing was sent"
+
+    async def _post_later(self, p):
+        await asyncio.sleep(HANDOFF_HOLD_S)
+        await self.post_pending(p)
+
+    async def post_pending(self, p=None):
+        """Send the waiting hand-off now (its window ended, or the call / Live is ending)."""
+        st = self.call.state
+        p = p or st.pending_handoff
+        if p is None or st.pending_handoff is not p:
+            return
+        st.pending_handoff = None
+        out = await self._post(p["words"], p["agent"])
+        if not out.startswith("posted"):
+            log_line("live: held hand-off failed", self.call.svc.turn_log)
+            st.notices.append("Sorry, that hand-off did not go through. Please say it again.")   # said when she is quiet
+
+    async def _post(self, words, agent):
         try:
             rec = await asyncio.to_thread(self.call.svc.handoff.create, words, words, role=agent)
         except Exception as e:
@@ -179,8 +256,9 @@ class LiveTools:
         if rec and rec.get("posted"):
             self.call.handoff_count = getattr(self.call, "handoff_count", 0) + 1
             self.call.posted_handoffs.append({"to": rec.get("to", ""), "words": words})
+            now = getattr(self.call.state, "call", None) or self.call   # after a reconnect: the phone's current line
             try:
-                await self.call.send({"type": "handoff", "id": rec.get("id", ""), "text": words, "to": rec.get("to", "")})
+                await now.send({"type": "handoff", "id": rec.get("id", ""), "text": words, "to": rec.get("to", "")})
             except Exception:
                 pass
             return "posted to %s" % rec.get("to", agent or "")
@@ -219,18 +297,91 @@ class LiveTools:
 class Call:
     def __init__(self, ws, svc):
         self.ws, self.svc = ws, svc
-        self.history = []
+        self.state = CallState()
+        self.history = self.state.history   # the same list: kept across reconnects
+        self.replaced = False
         self.phone_voice = False
         self.ears = "mac"
         self.task = None
         self.live = None
         self.live_pending = False
-        self.posted_handoffs = []
-        self.handoff_count = 0
+        self.live_lang = "en-US"
         self.started_at = time.strftime("%Y-%m-%d %H:%M:%S")
         self.bug = None
         self.bug_timer = None
         self.svc.last_call = self   # tests reach the live Call through this
+
+    @property
+    def handoff_count(self):
+        return self.state.handoff_count
+
+    @handoff_count.setter
+    def handoff_count(self, n):
+        self.state.handoff_count = n
+
+    @property
+    def posted_handoffs(self):
+        return self.state.posted_handoffs
+
+    @posted_handoffs.setter
+    def posted_handoffs(self, items):
+        self.state.posted_handoffs = items
+
+    def _use_state(self, st):
+        self.state = st
+        self.history = st.history
+
+    async def take_over(self):
+        """The phone came back on a new connection: this older Call must stop talking and stop writing to the
+        shared memory at once (its dead socket can take many seconds to close)."""
+        self.replaced = True   # its bridge's late items and failures are ignored from now on
+        for t in (getattr(self, "keep", None), getattr(self, "upd", None), getattr(self, "bug_timer", None)):
+            if t:
+                t.cancel()
+        live, self.live = self.live, None
+        if live:
+            try:
+                await live.close()
+            except Exception:
+                pass
+        await self.cancel_turn()
+        # a waiting hand-off keeps its timer; it reports on the new line (state.call)
+        self._closing = asyncio.ensure_future(self._close_quietly())   # a half-open socket can take 10 s: never wait
+
+    async def _close_quietly(self):
+        try:
+            await self.ws.close()
+        except Exception:
+            pass
+
+    def remember(self, role, text, **tags):
+        """One line of the call into its memory. In Live a line carries its turn / reply number, so a second
+        version of the same line (Whisper words, a cut reply) replaces it instead of adding one."""
+        text = (text or "").strip()
+        if not text:
+            return
+        key = "turn" if role == "user" else "reply"
+        tag = tags.get(key)
+        if tag is not None:
+            for line in reversed(self.history[-6:]):
+                if line.get("role") == role and line.get(key) == tag:
+                    line["text"] = text
+                    return
+        line = {"role": role, "text": text}
+        line.update({k: v for k, v in tags.items() if v is not None})
+        self.history.append(line)
+        del self.history[:-HISTORY_MAX]
+        self.state.last_used = time.time()
+
+    def seed_lines(self):
+        """The last lines of this call for a new Live session (reconnect, Live off-on, provider switch)."""
+        out, n = [], 0
+        for line in reversed(self.history[-SEED_LINES:]):
+            n += len(line["text"])
+            if n > SEED_CHARS:
+                break
+            out.append({"role": line["role"], "text": line["text"]})
+        return out[::-1]
 
     def _on_live_closed(self, bridge=None):
         if bridge is None or self.live is bridge:   # a replaced bridge closing late never ends its successor
@@ -252,6 +403,10 @@ class Call:
                 **extra,
             )
             holder.append(bridge)
+            bridge.seed = self.seed_lines()   # what this call said so far: a new session must not forget it
+            self.state.tag_base += 100000     # its turn / reply numbers never match an older session's lines
+            bridge._turn_no = bridge._reply_no = self.state.tag_base
+            bridge.language = self.live_lang   # the page's ZH/EN choice: a hint for the provider's ears
             try:
                 await asyncio.wait_for(bridge.start(), 6)   # never block the call on a silent provider
                 if bridge.closed:   # died right after connecting (its live_error already went out)
@@ -269,7 +424,7 @@ class Call:
     async def _live_to_qwen(self, failed):
         """The first-choice Live provider died mid-call (quota, network): carry on in Qwen Live instead of dropping
         her to classic mode."""
-        if not getattr(failed, "falls_back_to_qwen", False) or self.live_pending:
+        if self.replaced or not getattr(failed, "falls_back_to_qwen", False) or self.live_pending:
             return False
         self.live_pending = True
         try:
@@ -289,6 +444,8 @@ class Call:
         return True
 
     async def _live_out(self, item):
+        if self.replaced:   # the phone is on a newer connection: this old session's words are not the call's
+            return
         if isinstance(item, bytes):
             stopped_at = getattr(self.live, "stopped_at", None) if self.live else None
             if stopped_at is not None:
@@ -312,7 +469,13 @@ class Call:
                     await self._record_bug_words(words)
                     await self.send(item)
                     return
-            await self.send(item)
+                self.remember("user", words, turn=item.get("turn"))
+            elif item.get("type") == "live_said":
+                self.remember("assistant", str(item.get("text", "")), reply=item.get("reply"))
+            elif item.get("type") == "live_cut":   # she interrupted: she heard only this much of the reply
+                self.remember("assistant", str(item.get("text", "")), reply=item.get("reply"))
+                return   # memory only, the phone shows nothing
+            await self.send({k: v for k, v in item.items() if k not in ("turn", "reply")})
 
     async def send(self, obj):
         await self.ws.send(json.dumps(obj, ensure_ascii=False))
@@ -338,6 +501,12 @@ class Call:
             _, locked = self.svc.guard.record_failure()
         elif msg.get("resume") and self.svc.resume_ok(msg.get("resume")):
             ok = True
+            st = self.svc.call_state(msg["resume"])
+            if st is not None:   # the same call, back after a drop: keep its memory
+                old = st.call
+                if old is not None and old is not self:
+                    await old.take_over()
+                self._use_state(st)
         elif pin:
             ok, locked = self.svc.guard.check(pin)
         elif isinstance(msg.get("passkey"), dict) and self.svc.passkeys:
@@ -362,8 +531,14 @@ class Call:
         log_line("call: connected, %s, phone_voice=%s, ears=%s, home_screen_app=%s" % (VERSION, self.phone_voice, self.ears,
                  bool(msg.get("standalone"))), self.svc.turn_log)
         self.signed_with_pin = bool(msg.get("pin"))
-        await self.send({"type": "auth_ok", "version": VERSION, "resume": self.svc.issue_resume(), "targets": TARGETS,
+        token = self.svc.issue_resume()
+        self.state.tokens.add(token)
+        self.state.last_used = time.time()
+        if self.state not in self.svc.call_states:
+            self.svc.call_states.append(self.state)
+        await self.send({"type": "auth_ok", "version": VERSION, "resume": token, "targets": TARGETS,
                          "passkeys": self.svc.passkeys.count() if self.svc.passkeys else -1})
+        self.state.call = self
         self.keep = asyncio.create_task(self._keepalive())
         self.upd = asyncio.create_task(self._updates_loop())
         await self.send({"type": "status", "state": "listening"})
@@ -465,7 +640,9 @@ class Call:
         while True:
             try:
                 busy = (self.task is not None and not self.task.done()) or (self.live is not None and getattr(self.live, "busy", getattr(self.live, "response_active", False)))
-                if not busy:
+                if not busy and self.state.notices:
+                    self.task = asyncio.create_task(self._say_update(self.state.notices.pop(0)))
+                elif not busy:
                     items = await asyncio.to_thread(updates.pending, self.svc.updates_folder)
                     if items:
                         path, rec = items[0]
@@ -482,12 +659,12 @@ class Call:
         if path:
             await asyncio.to_thread(updates.mark_spoken, path)
             log_line("update spoken from %s" % (rec or {}).get("from"), self.svc.turn_log)
-        self.history.append({"role": "assistant", "text": line})
-        if self.live:   # Live shows Dot's words itself (live_said): one bubble, not two
+        if self.live:   # Live shows Dot's words itself (live_said, also its memory): one bubble, not two
             await self.live.say_exact(line)
-        else:
-            await self.send({"type": "transcript", "role": "assistant", "text": line})
-            await self.speak(line)
+            return
+        self.history.append({"role": "assistant", "text": line})
+        await self.send({"type": "transcript", "role": "assistant", "text": line})
+        await self.speak(line)
 
     async def _keepalive(self):
         """Keep the speech model and the front-desk process resident in memory while a call is open (idle processes get swapped out on this Mac)."""
@@ -555,6 +732,8 @@ class Call:
                         continue
                     kind = data.get("type")
                     if kind == "live":
+                        if data.get("lang") in ("zh-CN", "en-US"):
+                            self.live_lang = data["lang"]
                         if data.get("on"):
                             self.live_pending = True
                             try:
@@ -565,7 +744,7 @@ class Call:
                                 self.live = bridge
                                 self.live_pending = False
                                 await self.send({"type": "live_ok"})
-                                log_line("live: on", self.svc.turn_log)
+                                log_line("live: on (%s)" % self.live_lang, self.svc.turn_log)
                             except Exception as e:
                                 self.live = None
                                 self.live_pending = False
@@ -574,6 +753,7 @@ class Call:
                                 log_line("live: error %s" % reason, self.svc.turn_log)
                         else:
                             self.live_pending = False
+                            await LiveTools(self).post_pending()
                             if self.live:
                                 await self.live.close()
                                 self.live = None
@@ -641,6 +821,11 @@ class Call:
                     pass
                 self.live = None
                 log_line("live: off", self.svc.turn_log)
+            if not self.replaced:
+                await LiveTools(self).post_pending()
+            if self.state.call is self:
+                self.state.call = None
+                self.state.last_used = time.time()
             self._write_call_summary()
 
     async def _on_bug(self, snapshot):
@@ -735,8 +920,10 @@ class Call:
             valid = [
                 {"to": h["to"], "words": h["words"]}
                 for h in self.posted_handoffs
-                if h.get("to") and h.get("to") not in PRIVATE_ROLES
+                if h.get("to") and h.get("to") not in PRIVATE_ROLES and not h.get("summarized")
             ]
+            for h in self.posted_handoffs:   # a reconnect never writes the same hand-off twice
+                h["summarized"] = True
             if not valid:
                 return
             stamp = time.strftime("%Y%m%d-%H%M%S")

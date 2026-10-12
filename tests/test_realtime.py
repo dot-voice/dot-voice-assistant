@@ -92,7 +92,7 @@ class LiveBridgeTest(unittest.IsolatedAsyncioTestCase):
         upd = self.ws.sent[0]
         self.assertEqual(upd["type"], "session.update")
         names = [t["name"] for t in upd["session"]["tools"]]
-        self.assertEqual(names, ["hand_off", "get_status", "lookup"])
+        self.assertEqual(names, ["hand_off", "get_status", "cancel_hand_off", "lookup"])
         self.assertTrue(upd["session"]["voice"])
         self.assertIn("model=", self.url)
         await self.b.close()
@@ -432,13 +432,75 @@ class ServerLiveTest(unittest.IsolatedAsyncioTestCase):
 
         # Record says posted: True
         self.svc.handoff.create = mock.Mock(return_value={"posted": True, "to": "CRM", "id": "1"})
-        res = await tools.hand_off("research area", "CRM")
+        res = await tools._post("research area", "CRM")
         self.assertEqual(res, "posted to CRM")
 
         # Record says posted: False
         self.svc.handoff.create = mock.Mock(return_value={"posted": False, "to": "CRM", "post_error": "carry down"})
-        res = await tools.hand_off("research area", "CRM")
+        res = await tools._post("research area", "CRM")
         self.assertEqual(res, "not sent: carry down")
+
+    async def test_hand_off_can_be_corrected_before_it_is_sent(self):
+        # R26 (her gap G4, 2026-10-12): "no, I meant CRM" right after a hand-off changes it; nothing goes out early.
+        call = server.Call(FakeCallWS([]), self.svc)
+        tools = server.LiveTools(call)
+        self.svc.handoff.create = mock.Mock(return_value={"posted": True, "to": "CRM", "id": "1"})
+        with mock.patch.object(server, "HANDOFF_HOLD_S", 0.2):
+            res = await tools.hand_off("Call Alex about the offer.", "MW")
+            self.assertTrue(res.startswith("queued"))
+            self.svc.handoff.create.assert_not_called()
+            res = await tools.hand_off("No, I meant CRM.", "CRM", replaces_waiting=True)
+            self.assertTrue(res.startswith("updated"))
+            await asyncio.sleep(0.35)
+            self.svc.handoff.create.assert_called_once()
+            args, kw = self.svc.handoff.create.call_args
+            self.assertEqual(kw.get("role"), "CRM")
+            self.assertEqual(args[0], "Call Alex about the offer. No, I meant CRM.")
+            self.assertEqual(len(call.posted_handoffs), 1)
+            # a new request (not a correction) never swallows the waiting one: both go out
+            await tools.hand_off("Ask CRM about Sam.", "CRM")
+            await tools.hand_off("Ask Vault about Main Street.", "VAULT")
+            self.assertEqual(self.svc.handoff.create.call_count, 2)
+            await asyncio.sleep(0.35)
+        self.assertEqual([c.kwargs.get("role") for c in self.svc.handoff.create.call_args_list], ["CRM", "CRM", "VAULT"])
+
+    async def test_failed_held_hand_off_is_said_when_she_is_quiet(self):
+        # R8 + R26: a held hand-off that fails is told to her, but never over her voice (the updates loop says it).
+        call = server.Call(FakeCallWS([]), self.svc)
+        self.svc.handoff.create = mock.Mock(return_value={"posted": False, "post_error": "down"})
+        tools = server.LiveTools(call)
+        await tools.hand_off("Call Alex.", "CRM")
+        await tools.post_pending()
+        self.assertEqual(len(call.state.notices), 1)
+
+    async def test_new_live_session_never_overwrites_older_lines(self):
+        # R23: each Live session numbers its lines from a new base, so a restart (ZH/EN, reconnect) adds lines.
+        call = server.Call(FakeCallWS([]), self.svc)
+        for _ in range(2):
+            base = call.state.tag_base = call.state.tag_base + 100000
+            await call._live_out({"type": "live_heard", "text": "question %d" % base, "turn": base})
+            await call._live_out({"type": "live_said", "text": "answer %d" % base, "reply": base + 1})
+        self.assertEqual(len(call.history), 4)
+
+    async def test_replaced_call_is_silent(self):
+        # R23: after the phone came back on a new line, the old Call writes nothing to the shared memory.
+        call = server.Call(FakeCallWS([]), self.svc)
+        await call.take_over()
+        await call._live_out({"type": "live_said", "text": "late words", "reply": 9})
+        self.assertEqual(call.history, [])
+        self.assertFalse(await call._live_to_qwen(mock.MagicMock(falls_back_to_qwen=True)))
+
+    async def test_hand_off_cancel_and_flush(self):
+        call = server.Call(FakeCallWS([]), self.svc)
+        tools = server.LiveTools(call)
+        self.svc.handoff.create = mock.Mock(return_value={"posted": True, "to": "CRM", "id": "1"})
+        await tools.hand_off("Call Alex.", "CRM")
+        self.assertEqual(await tools.cancel_hand_off(), "cancelled, nothing was sent")
+        self.assertTrue((await tools.cancel_hand_off()).startswith("nothing to cancel"))
+        await tools.hand_off("Call Sam.", "CRM")
+        await tools.post_pending()   # the call / Live ends: a waiting hand-off goes out at once, never lost
+        self.svc.handoff.create.assert_called_once()
+        self.assertIsNone(call.state.pending_handoff)
 
     async def test_live_tools_max_handoffs_limit(self):
         ws = FakeCallWS([])
@@ -507,6 +569,59 @@ class ServerLiveTest(unittest.IsolatedAsyncioTestCase):
             line = mock_log.call_args[0][0]
             self.assertTrue(line.startswith("live first_audio_ms="))
             self.assertIsNone(fake_bridge.stopped_at)
+
+    async def test_live_words_become_call_memory_without_doubles(self):
+        # R23: Live writes the call's memory; a second version of the same line replaces it (Whisper words, a
+        # cut reply), her next question never replaces the last one, an update is stored once.
+        call = server.Call(FakeCallWS([]), self.svc)
+        await call._live_out({"type": "live_heard", "text": "is anything", "turn": 1})
+        await call._live_out({"type": "live_heard", "text": "Is anything stuck?", "turn": 1})
+        await call._live_out({"type": "live_heard", "text": "Call Alex.", "turn": 2})   # her reply was dropped
+        await call._live_out({"type": "live_said", "text": "Sent to the list. Anything else?", "reply": 1})
+        await call._live_out({"type": "live_cut", "text": "Sent to the ... (she interrupted)", "reply": 1})
+        self.assertEqual([(l["role"], l["text"]) for l in call.history], [
+            ("user", "Is anything stuck?"), ("user", "Call Alex."),
+            ("assistant", "Sent to the ... (she interrupted)")])
+        self.assertFalse(any("live_cut" in m for m in call.ws.sent))   # memory only
+        self.assertFalse(any('"turn"' in m or '"reply"' in m for m in call.ws.sent))
+        call.live = mock.MagicMock(busy=False, say_exact=mock.AsyncMock())
+        await call._say_update("CRM says done.")
+        self.assertEqual(len(call.history), 3)   # Live's own words (live_said) are the only writer
+
+    async def test_seed_lines_capped(self):
+        call = server.Call(FakeCallWS([]), self.svc)
+        for i in range(60):
+            call.remember("user" if i % 2 else "assistant", "line %d " % i + "x" * 200)
+        self.assertEqual(len(call.history), server.HISTORY_MAX)
+        seed = call.seed_lines()
+        self.assertLessEqual(sum(len(l["text"]) for l in seed), server.SEED_CHARS)
+        self.assertTrue(seed[-1]["text"].startswith("line 59"))
+
+    def test_qwen_gets_the_call_in_its_instructions(self):
+        note = realtime.history_note([{"role": "user", "text": "the blue house"}, {"role": "assistant", "text": "Noted."}])
+        self.assertIn("Caller: the blue house", note)
+        self.assertIn("You: Noted.", note)
+        self.assertEqual(realtime.history_note([]), "")
+
+    def test_cut_text_keeps_what_she_heard(self):
+        self.assertEqual(realtime.cut_text("one two three four", 0.5), "one two ... (she interrupted)")
+        self.assertEqual(realtime.cut_text("one two", 1.0), "one two")
+        self.assertIn("before hearing", realtime.cut_text("one two", 0.1))
+        self.assertTrue(realtime.cut_text("\u4f60\u597d\u4e16\u754c", 0.5).startswith("\u4f60\u597d ..."))
+
+    async def test_summary_never_repeats_a_hand_off_after_reconnect(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            call = server.Call(FakeCallWS([]), self.svc)
+            call.svc.handoff.folder = tmpdir
+            call.posted_handoffs.append({"to": "CRM", "words": "follow up"})
+            call._write_call_summary()
+            call2 = server.Call(FakeCallWS([]), self.svc)
+            call2._use_state(call.state)
+            call2._write_call_summary()
+            self.assertEqual(len(os.listdir(tmpdir)), 1)
+            call2.posted_handoffs.append({"to": "MW", "words": "new post"})
+            call2._write_call_summary()
+            self.assertEqual(len(os.listdir(tmpdir)), 2)
 
     async def test_call_summary_file_written_only_when_handoff_posted_without_private_roles(self):
         with tempfile.TemporaryDirectory() as tmpdir:

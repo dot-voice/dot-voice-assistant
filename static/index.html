@@ -267,7 +267,7 @@ function connect() {
           liveOk = false;
           setState("connecting");
           logEvent("ws_send:live:on");
-          ws.send(JSON.stringify({ type: "live", on: true }));
+          sendLiveOn();
         }
         resolve();
       }
@@ -318,6 +318,7 @@ function onMessage(m) {
   else if (m.type === "passkey_fail") addChip("Face ID setup did not work. The PIN still works.", true);
   else if (m.type === "error") { lastSent = ""; addChip("Error: " + m.message, true); }
   else if (m.type === "live_ok") {
+    if (liveLangSent !== recogLang) { sendLiveOn(); return; }   // ZH/EN tapped while Live was starting: restart once more
     liveOk = true;
     setState("listening");
   }
@@ -469,7 +470,7 @@ function setLiveButton() {
 }
 function setEarsButton() {
   $("langBtn").querySelector(".lbl").textContent = recogLang === "zh-CN" ? "ZH" : "EN";
-  $("langBtn").style.display = (!liveMode && earsPhone) ? "" : "none";
+  $("langBtn").style.display = (liveMode || earsPhone) ? "" : "none";   // Live: a hint for Gemini's ears
 }
 function getAudioCtx() {
   const AC = window.AudioContext || window.webkitAudioContext;
@@ -1019,7 +1020,7 @@ async function setLive(on, thisCallOnly) {
     liveOk = false;   // "Connecting" until the server says Live is up (never a false "Listening")
     setState("connecting");
     rsTail = new Float32Array(0); rsPos = 0;
-    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "live", on: true }));
+    if (ws && ws.readyState === 1) sendLiveOn();
     recogWant = false;
     stopRecog();
     showLive("");
@@ -1059,9 +1060,18 @@ $("liveBtn").onclick = async () => {
   await setLive(!liveMode);
 };
 
+let liveLangSent = null;
+function sendLiveOn() {   // Live on, with the ZH/EN choice as the language hint
+  liveLangSent = recogLang;
+  ws.send(JSON.stringify({ type: "live", on: true, lang: recogLang }));
+}
 $("langBtn").onclick = () => {
   recogLang = recogLang === "zh-CN" ? "en-US" : "zh-CN"; store('lang', recogLang); setEarsButton();
   if (recog) { stopRecog(); }   // render restarts it with the new language
+  if (liveMode && liveOk && ws && ws.readyState === 1) {   // Live: reconnect with the new language hint (memory kept)
+    liveOk = false; setState("connecting");
+    sendLiveOn();
+  }
   render();
 };
 $("stopTalk").onclick = () => { if (inCall) { lastSent = ""; interrupt(); } };   // Skip drops the words too

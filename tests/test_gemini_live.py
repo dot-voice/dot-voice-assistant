@@ -75,13 +75,14 @@ class FakeSession:
 
     async def send_client_content(self, turns=None, turn_complete=True):
         self.client.append(turns)
+        self.client_complete = getattr(self, "client_complete", []) + [turn_complete]
 
     async def close(self):
         self.closed = True
 
 
 class GeminiBridgeTest(unittest.IsolatedAsyncioTestCase):
-    async def make(self, transcribe=None, key="k"):
+    async def make(self, transcribe=None, key="k", seed=None, language=None):
         self.sessions = []
         self.configs = []
         self.phone = []
@@ -104,6 +105,10 @@ class GeminiBridgeTest(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(gemini_live.tts, "_keychain", return_value=key):
             self.b = gemini_live.GeminiBridge(to_phone, self.tools, "be brief", connect=connect,
                                               transcribe=transcribe, on_closed=on_closed)
+            if seed:
+                self.b.seed = seed
+            if language:
+                self.b.language = language
             await self.b.start()
         self.s = self.sessions[0]
 
@@ -123,7 +128,7 @@ class GeminiBridgeTest(unittest.IsolatedAsyncioTestCase):
         cfg = self.configs[0]
         self.assertEqual(cfg.speech_config.voice_config.prebuilt_voice_config.voice_name, self.b.voice)
         names = [f.name for f in cfg.tools[0].function_declarations]
-        self.assertEqual(names, ["hand_off", "get_status", "lookup"])
+        self.assertEqual(names, ["hand_off", "get_status", "cancel_hand_off", "lookup"])
         self.assertIsNotNone(cfg.session_resumption)
         self.assertIsNotNone(cfg.context_window_compression.sliding_window)
         self.assertEqual(cfg.system_instruction.parts[0].text if hasattr(cfg.system_instruction, "parts")
@@ -355,6 +360,75 @@ class GeminiBridgeTest(unittest.IsolatedAsyncioTestCase):
         await self.settle()
         self.assertFalse(self.dicts("live_stop"))
         self.assertIn("tasks please", self.b.last_heard)
+        await self.b.close()
+
+    async def test_new_session_is_seeded_with_the_call(self):
+        # R23: a new session (reconnect, Live off-on) gets the call so far as past turns, without a reply.
+        seed = [{"role": "user", "text": "the blue house"}, {"role": "user", "text": "on Main Street"},
+                {"role": "assistant", "text": "Noted."}]
+        await self.make(seed=seed)
+        turns = self.s.client[0]
+        self.assertEqual([t.role for t in turns], ["user", "model"])
+        self.assertEqual(turns[0].parts[0].text, "the blue house on Main Street")
+        self.assertEqual(self.s.client_complete, [False])
+        await self.b.close()
+        await self.make(seed=seed[:2])   # her last words never got a reply: the seed says so (no answer now)
+        self.assertIn("not answered", self.s.client[0][-1].parts[0].text)
+        await self.b.close()
+
+    async def test_barge_then_gemini_interrupt_remembers_what_she_heard(self):
+        # R25 main path: she talks over Dot (phone stops it), then Gemini says interrupted, no turn_complete.
+        await self.make()
+        self.s.push(audio(b"\x01" * 480000))
+        self.s.push(said("one two three four five six seven eight nine ten"))
+        await self.settle()
+        await asyncio.sleep(0.5)
+        await self.b.barge()
+        self.s.push(content(interrupted=True))
+        await self.settle()
+        cuts = self.dicts("live_cut")
+        self.assertEqual(len(cuts), 1)
+        self.assertNotIn("ten", cuts[0]["text"])
+        await self.b.close()
+
+    async def test_gemini_interrupt_remembers_what_she_heard(self):
+        # R25 when Gemini itself says interrupted: the memory still gets the part she heard.
+        await self.make()
+        self.s.push(audio(b"\x01" * 480000))
+        self.s.push(said("one two three four five six seven eight nine ten"))
+        await self.settle()
+        await asyncio.sleep(0.5)
+        self.s.push(content(interrupted=True))
+        await self.settle()
+        cuts = self.dicts("live_cut")
+        self.assertEqual(len(cuts), 1)
+        self.assertNotIn("ten", cuts[0]["text"])
+        await self.b.close()
+
+    async def test_language_hint_follows_the_zh_button(self):
+        # R24: the ZH/EN button picks the language Gemini listens for first.
+        await self.make(language="zh-CN")
+        self.assertEqual(self.configs[0].input_audio_transcription.language_codes[0], "cmn-Hans-CN")
+        await self.b.close()
+        await self.make()
+        self.assertEqual(self.configs[0].input_audio_transcription.language_codes[0], "en-US")
+        await self.b.close()
+
+    async def test_barge_mid_reply_remembers_only_what_she_heard(self):
+        # R25: she stops Dot early; the call's memory keeps only the start of the reply, not the unplayed rest.
+        await self.make()
+        self.s.push(audio(b"\x01" * 480000))   # a 10 s reply, all sent at once
+        self.s.push(said("one two three four five six seven eight nine ten"))
+        await self.settle()
+        await asyncio.sleep(0.5)
+        await self.b.barge()
+        self.s.push(done())
+        await self.settle()
+        cuts = self.dicts("live_cut")
+        self.assertEqual(len(cuts), 1)
+        self.assertTrue(cuts[0]["text"].endswith("(she interrupted)") or "before hearing" in cuts[0]["text"])
+        self.assertNotIn("ten", cuts[0]["text"])
+        self.assertEqual(self.dicts("live_said"), [])
         await self.b.close()
 
     async def test_barge_keeps_her_first_words_for_hand_off(self):

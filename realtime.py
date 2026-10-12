@@ -38,12 +38,19 @@ def build_tools():
         agent["enum"] = names
     return [
         {"type": "function", "name": "hand_off",
-         "description": "Pass real work or a request to the right agent session.",
-         "parameters": {"type": "object", "properties": {"agent": agent}, "required": []}},
+         "description": "Pass real work or a request to the right agent session. It waits a few seconds before it "
+                        "is sent: if the caller corrects it (another session, more detail), call hand_off again and "
+                        "it replaces the waiting one.",
+         "parameters": {"type": "object", "properties": {"agent": agent, "replaces_waiting": {
+             "type": "boolean", "description": "True only when the caller corrects the hand-off you just made."}},
+             "required": []}},
         {"type": "function", "name": "get_status",
          "description": "Status, tasks, progress or updates of the agent sessions. Pass session when one is named; "
                         "leave it out for all of them.",
          "parameters": {"type": "object", "properties": {"session": dict(agent, description="The one session asked about, if any.")}}},
+        {"type": "function", "name": "cancel_hand_off",
+         "description": "The caller says not to send the hand-off just made.",
+         "parameters": {"type": "object", "properties": {}}},
         {"type": "function", "name": "lookup",
          "description": "Look up weather, time, notes, rules, people, properties, or past decisions.",
          "parameters": {"type": "object", "properties": {"question": {"type": "string", "description": "What to look up."}}, "required": ["question"]}},
@@ -57,11 +64,33 @@ def build_instructions(owner):
     return (
         f"You are the assistant of {owner} on a hands-free call. Reply in the language spoken, "
         "in one or two short sentences. For any real work call hand_off. Never claim work is done "
-        "unless a tool output says so. After hand_off say only who it went to. For status questions "
+        "unless a tool output says so. If the caller interrupts you, she did not hear the rest of your reply. After hand_off say only who it went to. For status questions "
         "call get_status and read its output word for word. For weather, time, the caller's rules, people, "
         "properties or past decisions call lookup and answer only from its output; never say you have "
-        "no real-time access. Never invent facts."
+        "no real-time access. What the caller already said in this call counts: answer that from the conversation, "
+        "without lookup. Never invent facts."
     )
+
+
+def history_note(seed):
+    """The call so far, for a provider that cannot be seeded with turns (Qwen): appended to its instructions."""
+    if not seed:
+        return ""
+    return "\n\nConversation so far in this call (continue it, do not repeat it):\n" + "\n".join(
+        ("Caller: " if line["role"] == "user" else "You: ") + line["text"] for line in seed)
+
+
+def cut_text(said, fraction):
+    """The part of a reply she heard before she interrupted it."""
+    said = (said or "").strip()
+    if fraction >= 0.98 or not said:
+        return said
+    words = said.split()
+    if len(words) > 1:
+        heard = " ".join(words[:int(len(words) * max(0.0, fraction))])
+    else:   # Chinese: no spaces
+        heard = said[:int(len(said) * max(0.0, fraction))]
+    return (heard + " ... (she interrupted)") if heard else "(she interrupted before hearing this reply)"
 
 
 _DOWN_UNTIL = {}   # provider -> monotonic time it may be tried again (quota used up)
@@ -121,6 +150,10 @@ class LiveBridge:
         self.current_response_id = None
         self.cancelled_response_ids = set()
         self.handoff_count = 0
+        self.seed = []              # the call so far (server sets it before start): a new session must not forget it
+        self.language = "en-US"
+        self._turn_no = 0           # her turns, so a second version of her words replaces the first in memory
+        self._reply_no = 0          # Dot's replies
 
     @property
     def user_speaking(self):
@@ -168,7 +201,7 @@ class LiveBridge:
                                "silence_duration_ms": int(_cfg("live_silence_ms") or 900)},
             "tools": TOOLS,
             "tool_choice": "auto",
-            "instructions": self.instructions,
+            "instructions": self.instructions + history_note(self.seed),
         }
         m = _cfg("live_transcription_model")
         if m != "off":   # the documented (fixed) model for the omni realtime series; Whisper stays the fallback
@@ -274,6 +307,7 @@ class LiveBridge:
             self.response_active = True
             await self.send_to_phone(base64.b64decode(ev.get("delta", "")))
         elif t == "input_audio_buffer.speech_started":
+            self._turn_no += 1
             self._user_speaking = True
             self.stopped_at = None
             self._transcript_done.clear()
@@ -298,11 +332,12 @@ class LiveBridge:
             self.last_heard = self._turn_transcript
             self._turn_words = self._turn_transcript
             self._transcript_done.set()
-            await self.send_to_phone({"type": "live_heard", "text": self.last_heard})
+            await self.send_to_phone({"type": "live_heard", "text": self.last_heard, "turn": self._turn_no})
         elif t == "response.audio_transcript.done":
             resp_id = ev.get("response_id") or (ev.get("response") or {}).get("id")
             if not (resp_id and resp_id in self.cancelled_response_ids):
-                await self.send_to_phone({"type": "live_said", "text": ev.get("transcript", "")})
+                self._reply_no += 1
+                await self.send_to_phone({"type": "live_said", "text": ev.get("transcript", ""), "reply": self._reply_no})
         elif t == "response.done":
             self.response_active = False
             self._user_speaking = False
@@ -335,7 +370,7 @@ class LiveBridge:
                 words = ""
             if words:
                 self._whisper_words = self.last_heard = self._turn_words = words
-                await self.send_to_phone({"type": "live_heard", "text": words})
+                await self.send_to_phone({"type": "live_heard", "text": words, "turn": self._turn_no})
                 return words
         if not self._transcript_done.is_set():
             try:
@@ -376,10 +411,16 @@ class LiveBridge:
             words = await self._get_turn_words()
             if not words or len(words) < 2:
                 return "not sent: I did not catch the words, ask the caller to say it again"
-            out = await self.tools_impl.hand_off(words, args.get("agent"))
-            if str(out).startswith("posted"):
+            if args.get("replaces_waiting"):
+                out = await self.tools_impl.hand_off(words, args.get("agent"), replaces_waiting=True)
+            else:
+                out = await self.tools_impl.hand_off(words, args.get("agent"))
+            if str(out).startswith(("posted", "queued")):   # a correction ("updated") is not a new hand-off
                 self.handoff_count += 1
             return out
+        elif name == "cancel_hand_off":
+            cancel = getattr(self.tools_impl, "cancel_hand_off", None)
+            return await cancel() if cancel else "nothing to cancel"
         elif name == "get_status":   # the model picks the session; her words only help pick it
             if not self._turn_transcript and not self._transcript_done.is_set():
                 try:   # her words of THIS turn may still be on their way (never the last turn's words)

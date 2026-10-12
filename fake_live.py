@@ -126,6 +126,9 @@ class FakeLiveSession:
                 return
 
     async def send_client_content(self, turns=None, turn_complete=True):
+        if not turn_complete:   # past turns of the call (seed): remembered, never answered - like the real one
+            self.seeded = list(turns or [])
+            return
         self.generating = asyncio.ensure_future(self._reply())
 
     async def send_tool_response(self, function_responses=None):

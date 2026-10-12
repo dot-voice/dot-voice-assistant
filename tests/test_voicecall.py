@@ -510,6 +510,31 @@ class TestServer(unittest.IsolatedAsyncioTestCase):
         ws3, bad = await self.raw_auth({"type": "auth", "pin": "", "resume": "made-up"})
         self.assertEqual(bad["type"], "auth_fail")
 
+    async def test_reconnect_keeps_call_memory(self):
+        # R23: the line drops and the phone comes back with its token: same call, same memory, old Call silenced.
+        ws, first = await self.client()
+        old = self.svc.last_call
+        old.remember("user", "the blue house on Main Street", turn=1)
+        old.remember("assistant", "Sent to CRM.", reply=1)
+        old.handoff_count = 2
+        ws2, ok = await self.raw_auth({"type": "auth", "pin": "", "resume": first["resume"]})
+        self.assertEqual(ok["type"], "auth_ok")
+        new = self.svc.last_call
+        self.assertIsNot(new, old)
+        self.assertTrue(old.replaced)
+        self.assertEqual([l["text"] for l in new.history], ["the blue house on Main Street", "Sent to CRM."])
+        self.assertEqual(new.handoff_count, 2)
+        self.assertEqual(new.seed_lines()[0], {"role": "user", "text": "the blue house on Main Street"})
+        # an older token of the same call still finds the memory
+        ws3, ok3 = await self.raw_auth({"type": "auth", "pin": "", "resume": first["resume"]})
+        self.assertEqual(ok3["type"], "auth_ok")
+        self.assertIs(self.svc.last_call.history, new.history)
+        # a fresh PIN sign-in is a new call: no memory
+        ws4, ok4 = await self.client()
+        self.assertEqual(self.svc.last_call.history, [])
+        for w in (ws, ws2, ws3, ws4):
+            await w.close()
+
     async def test_bad_face_id_counts_toward_lockout(self):
         class NoPasskey:
             def verify_login(self, cred): return False

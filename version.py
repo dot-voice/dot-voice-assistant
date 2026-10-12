@@ -3,7 +3,7 @@ import glob
 import os
 import time
 
-VERSION = "v47"
+VERSION = "v48"
 _HERE = os.path.dirname(os.path.abspath(__file__))
 # BUILT = when the newest code file changed, so the page date can never be stale again.
 BUILT = time.strftime("%Y-%m-%d %H:%M", time.localtime(max(

@@ -96,6 +96,9 @@ class GeminiBridge(realtime.LiveBridge):
         self.session = None
         self._key = None
         self._resume_handle = None          # latest session resumption handle
+        self._reply_total = 0        # bytes of the current reply's audio (all of it, also what was dropped)
+        self._reply_sent = 0         # bytes of it sent to the phone
+        self._cut_played = None      # seconds of the reply she heard when she interrupted it
         self._reconnecting = False
         self._drop_audio = False     # cancel(): drop the rest of this reply
         self._heard = ""             # her words so far in this turn (input transcription)
@@ -166,7 +169,9 @@ class GeminiBridge(realtime.LiveBridge):
                     end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
                     prefix_padding_ms=300,
                     silence_duration_ms=int(realtime._cfg("live_silence_ms_gemini") or SILENCE_MS))),
-            input_audio_transcription=types.AudioTranscriptionConfig(),
+            # Her ZH/EN choice first; both always allowed (real API: Chinese transcribed with either order).
+            input_audio_transcription=types.AudioTranscriptionConfig(
+                language_codes=["cmn-Hans-CN", "en-US"] if self.language == "zh-CN" else ["en-US", "cmn-Hans-CN"]),
             output_audio_transcription=types.AudioTranscriptionConfig(),
             session_resumption=types.SessionResumptionConfig(handle=handle),
             # Free tier allows 65K tokens/min and each turn sends the whole context (measured ~1K tokens a turn,
@@ -185,8 +190,33 @@ class GeminiBridge(realtime.LiveBridge):
             _note_quota(e)
             raise
         self.ws = self.session   # LiveBridge._fail closes self.ws
+        await self._seed_session()
         self._out_task = asyncio.ensure_future(self._playout())
         self.reader = asyncio.ensure_future(self._read_loop())
+
+    async def _seed_session(self):
+        """A new session in the same call (phone reconnect, Live off-on, provider switch) gets the call so far as
+        past turns, without a reply (real API 2026-10-12: turn_complete=False is remembered and not answered).
+        Only at start: a GoAway resume keeps the session's own memory."""
+        if not self.seed:
+            return
+        types = _types()
+        turns = []
+        seed = [dict(line) for line in self.seed]
+        if seed[-1]["role"] == "user":   # her last words never got a reply (the line dropped): not a question now
+            seed[-1]["text"] += " (not answered: the line dropped)"
+        for line in seed:
+            role = "user" if line["role"] == "user" else "model"
+            if turns and turns[-1][0] == role:
+                turns[-1][1].append(line["text"])
+            else:
+                turns.append((role, [line["text"]]))
+        try:
+            await self.session.send_client_content(turns=[types.Content(role=r, parts=[types.Part(text=" ".join(t))])
+                                                          for r, t in turns], turn_complete=False)
+            self._log_line("live: seeded %d lines" % len(self.seed))
+        except Exception as e:   # never fail the call over its memory
+            self._log_line("live: seed failed (%s)" % (str(e) or type(e).__name__)[:80])
 
     def _flush_audio(self):
         self._out_gen += 1   # queued pieces of the old reply are skipped
@@ -208,6 +238,7 @@ class GeminiBridge(realtime.LiveBridge):
             self._play_until = max(now, self._play_until) + len(piece) / 48000.0
             try:
                 await self.send_to_phone(piece)
+                self._reply_sent += len(piece)
             except Exception:
                 pass
 
@@ -431,6 +462,7 @@ class GeminiBridge(realtime.LiveBridge):
     def _start_turn(self):
         """Dot's reply ended: the floor is hers again; collect her audio and words for the next turn."""
         self._in_turn = True
+        self._turn_no += 1
         self._user_speaking = False
         self.response_active = False
         self._drop_audio = False
@@ -456,6 +488,9 @@ class GeminiBridge(realtime.LiveBridge):
         if not self._in_turn:
             return
         self._in_turn = False
+        self._reply_no += 1
+        self._reply_total = self._reply_sent = 0
+        self._cut_played = None
         self._user_speaking = False
         if self.stopped_at is None:   # her last words (no VAD end event) or now
             self.stopped_at = self._activity_at if self._activity_at else time.monotonic()
@@ -470,7 +505,7 @@ class GeminiBridge(realtime.LiveBridge):
     async def _send_heard(self):
         if not self._heard_sent and self._heard.strip():
             self._heard_sent = True
-            await self.send_to_phone({"type": "live_heard", "text": self._heard.strip()})
+            await self.send_to_phone({"type": "live_heard", "text": self._heard.strip(), "turn": self._turn_no})
 
     async def _on_message(self, msg):
         upd = getattr(msg, "session_resumption_update", None)
@@ -531,9 +566,12 @@ class GeminiBridge(realtime.LiveBridge):
             return False
         self._log_line("live: she interrupted, Dot stopped (%s) voice=%.1fs echo_floor=%d" % (
             why, self._voice_s, self._play_floor))
+        # what she heard of this reply: sent minus what the phone still had queued
+        self._cut_played = max(0.0, self._reply_sent / 48000.0 - max(0.0, self._play_until - time.monotonic()))
         self._flush_audio()
         if self._in_turn:   # the tail of a finished reply: her turn audio starts at her voice
             self._turn_buf = bytearray(self._onset_audio())
+            await self._send_cut(self._recent_said)
         else:
             self._barge = True               # her words from now on start her next turn
             self._barge_started = True
@@ -596,6 +634,9 @@ class GeminiBridge(realtime.LiveBridge):
                 self._transcript_done.set()
         if sc.interrupted:
             self._log_line("live: gemini interrupted playing=%.1fs" % max(0.0, self._play_until - time.monotonic()))
+            if self._cut_played is None:   # memory keeps only what she heard of this reply
+                self._cut_played = max(0.0, self._reply_sent / 48000.0 - max(0.0, self._play_until - time.monotonic()))
+            await self._send_cut(self._said.strip())   # also after a phone barge-in (its cut is still waiting)
             self._flush_audio()
             await self._send_heard()
             self._start_turn()
@@ -608,6 +649,7 @@ class GeminiBridge(realtime.LiveBridge):
                 data = getattr(getattr(p, "inline_data", None), "data", None)
                 if data:
                     await self._end_turn()
+                    self._reply_total += len(data)
                     if not self._drop_audio:
                         data = bytes(data)
                         for i in range(0, len(data), PIECE):
@@ -622,13 +664,23 @@ class GeminiBridge(realtime.LiveBridge):
             self._said = ""
             self._recent_said = said
             if said and not self._drop_audio:
-                await self.send_to_phone({"type": "live_said", "text": said})
+                await self.send_to_phone({"type": "live_said", "text": said, "reply": self._reply_no})
+            elif said and self._cut_played is not None:   # stopped mid-reply: remember only what she heard
+                await self._send_cut(said)
             if not self._in_turn or self._draining:
                 exact = self._exact_pending
                 self._exact_pending = False
                 self._start_turn()
                 if exact:   # say_exact was sent while the old reply drained: it is the reply now playing
                     self.response_active = True
+
+    async def _send_cut(self, said):
+        """She interrupted this reply: the call's memory keeps only the part she heard (server only, not shown)."""
+        if self._cut_played is None or not said or not self._reply_total:
+            return
+        fraction = self._cut_played / (self._reply_total / 48000.0)
+        self._cut_played = None
+        await self.send_to_phone({"type": "live_cut", "text": realtime.cut_text(said, fraction), "reply": self._reply_no})
 
     # ---- tools (logic shared with LiveBridge._exec_tool) ----
 
