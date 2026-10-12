@@ -130,6 +130,8 @@ class LiveBridge:
             if ev.get("type") == "error":
                 raise RuntimeError(str((ev.get("error") or {}).get("message") or "server error")[:120])
 
+    transcript_wait_s = 1.5   # how long a tool waits for Qwen's transcript before running Whisper
+
     async def start(self):
         key = tts._keychain(tts.QWEN_KEYCHAIN)
         self.ws = await self._connect(URL + self.model, additional_headers={"Authorization": "Bearer " + key})
@@ -139,15 +141,16 @@ class LiveBridge:
             "voice": self.voice,
             "input_audio_format": "pcm16",
             "output_audio_format": "pcm24",
-            "turn_detection": {"type": "server_vad"},
+            # semantic_vad waits for the end of the thought, not just silence (Alibaba recommends it for 3.5-omni)
+            "turn_detection": {"type": _cfg("live_vad") or "semantic_vad", "threshold": 0.5,
+                               "silence_duration_ms": int(_cfg("live_silence_ms") or 900)},
             "tools": TOOLS,
             "tool_choice": "auto",
             "instructions": self.instructions,
         }
-        if _cfg("live_transcription_model"):
-            m = _cfg("live_transcription_model")
-            m_name = m if isinstance(m, str) and m not in ("1", "true", "True") else "gummy-realtime-v1"
-            session_cfg["input_audio_transcription"] = {"model": m_name}
+        m = _cfg("live_transcription_model")
+        if m != "off":   # the documented (fixed) model for the omni realtime series; Whisper stays the fallback
+            session_cfg["input_audio_transcription"] = {"model": "qwen3-asr-flash-realtime"}
         await self._send({"type": "session.update", "session": session_cfg})
         await self._expect("session.updated")
         self.reader = asyncio.ensure_future(self._read_loop())
@@ -298,11 +301,11 @@ class LiveBridge:
     async def _get_turn_words(self):
         if self._turn_words is not None:
             return self._turn_words
-        if not self._transcript_done.is_set() and self.transcribe is None:
+        if not self._transcript_done.is_set():   # Qwen's own transcript first; Whisper only if it is late
             try:
-                await asyncio.wait_for(self._transcript_done.wait(), timeout=2.5)
+                await asyncio.wait_for(self._transcript_done.wait(), timeout=2.5 if self.transcribe is None else self.transcript_wait_s)
             except (asyncio.TimeoutError, Exception):
-                pass
+                self._log_line("live transcript late, using Whisper")
         words = self._turn_transcript
         pcm = self.turn_pcm or (bytes(self._turn_buf) if self._turn_buf else b"")
         if not words and self.transcribe is not None:
@@ -319,6 +322,15 @@ class LiveBridge:
             self.last_heard = words
             self._turn_words = words
         return self._turn_words or ""
+
+    def _log_line(self, text):
+        path = self.turn_log or getattr(getattr(getattr(self.tools_impl, "call", None), "svc", None), "turn_log", None)
+        if path:
+            try:
+                with open(path, "a") as f:
+                    f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + text + "\n")
+            except OSError:
+                pass
 
     def _log_tool(self, name, duration_ms):
         path = self.turn_log

@@ -132,6 +132,7 @@ class Services:
         self.guard, self.allowed_login, self.log_calls, self.turn_log = guard, allowed_login, log_calls, turn_log
         self.passkeys = passkeys          # Face ID sign-in (passkey.py); None = PIN only
         self.updates_folder = updates.FOLDER
+        self.live_connect = None          # tests/harness: replaces the Qwen realtime websocket connect
         self.resume = {}                  # reconnect tokens: token -> expiry. Memory only, gone when the service restarts.
 
     def issue_resume(self):
@@ -496,6 +497,7 @@ class Call:
                                     await self.live.close()
                                     self.live = None
                                 transcribe_fn = getattr(getattr(self.svc, "speech", None) or getattr(self.svc, "stt", None), "transcribe", None)
+                                extra = {"connect": self.svc.live_connect} if getattr(self.svc, "live_connect", None) else {}
                                 bridge = realtime.LiveBridge(
                                     self._live_out,
                                     LiveTools(self),
@@ -503,9 +505,10 @@ class Call:
                                     transcribe=transcribe_fn,
                                     on_closed=self._on_live_closed,
                                     turn_log=self.svc.turn_log,
+                                    **extra,
                                 )
                                 try:
-                                    await asyncio.wait_for(bridge.start(), 15)   # never block the call on a silent provider
+                                    await asyncio.wait_for(bridge.start(), 6)   # never block the call on a silent provider
                                 except BaseException:
                                     try:
                                         await bridge.close()
@@ -807,7 +810,7 @@ def real_services(args):
             from frontdesk import QwenAgainFrontDesk
             desk = ChainFrontDesk(q, QwenAgainFrontDesk(q))   # Qwen-only mode: no Haiku answers
     threading.Thread(target=desk.warm, daemon=True).start()   # persistent front-desk process, ready before the first call
-    return Services(speech, desk, default_tts(), FileHandoff(),
+    return Services(speech, desk, default_tts(), FileHandoff(post=not args.no_post),
                     PinGuard(pin), allowed_login=os.environ.get("VOICE_ALLOWED_LOGIN", ""),
                     log_calls=os.environ.get("VOICE_CALL_LOGS", "0") == "1", passkeys=load_passkeys())
 
@@ -822,8 +825,33 @@ def load_passkeys():
         return None
 
 
+class SlowFakeFrontDesk(FakeFrontDesk):
+    """Harness only: the fake front desk with a think delay, so words can arrive while it thinks."""
+
+    def __init__(self, delay_s):
+        super().__init__()
+        self.delay_s = delay_s
+
+    def reply(self, history, text):
+        time.sleep(self.delay_s)
+        return super().reply(history, text)
+
+
+def fake_services(args):
+    """--fake: no models, no cloud, no messages to other sessions. For the browser harness on a staging port."""
+    pin = load_or_create_pin(PIN_FILE)
+    delay = float(os.environ.get("VOICE_FAKE_DELAY_S", "1.5"))
+    svc = Services(FakeSpeechToText("words from mic"), SlowFakeFrontDesk(delay), FakeTextToSpeech(), FakeHandoff(),
+                   PinGuard(pin))
+
+    async def no_live(url, **kw):   # never reach Qwen from the harness: Live fails and the page must fall back
+        raise ConnectionRefusedError("fake mode: no Live provider")
+    svc.live_connect = no_live
+    return svc
+
+
 async def run_forever(args):
-    svc = real_services(args)
+    svc = fake_services(args) if args.fake else real_services(args)
     server = await serve(svc, args.host, args.port)
     print("voice-call listening on %s:%d (PIN in %s). Put HTTPS in front with: tailscale serve --bg %d"
           % (args.host, args.port, PIN_FILE, args.port), flush=True)
@@ -973,6 +1001,8 @@ def main():
     ap.add_argument("--warm", action="store_true", help="download and load the speech model now (first run only)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=PORT)
+    ap.add_argument("--no-post", action="store_true", help="staging: hand-offs stay in handoff/, no messages to sessions")
+    ap.add_argument("--fake", action="store_true", help="fake brain/voice/hand-offs (browser harness, staging port)")
     args = ap.parse_args()
     if args.selftest:
         return selftest()

@@ -156,9 +156,17 @@ class LiveBridgeTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.b.response_active)
         await self.b.close()
 
+    async def test_session_uses_semantic_vad_and_qwen_asr(self):
+        await self.make()
+        upd = [e for e in self.ws.sent if e.get("type") == "session.update"][0]["session"]
+        self.assertEqual(upd["turn_detection"]["type"], "semantic_vad")
+        self.assertEqual(upd["input_audio_transcription"]["model"], "qwen3-asr-flash-realtime")
+        await self.b.close()
+
     async def test_whisper_fallback_when_no_provider_transcript(self):
         fake_transcribe = mock.Mock(return_value="transcribed by whisper")
         await self.make(transcribe=fake_transcribe)
+        self.b.transcript_wait_s = 0
         self.ws.push({"type": "input_audio_buffer.speech_started"})
         self.ws.push({"type": "input_audio_buffer.speech_stopped"})
         self.ws.push({"type": "response.function_call_arguments.done", "name": "hand_off", "call_id": "c_wh",

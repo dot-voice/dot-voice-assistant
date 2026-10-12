@@ -118,7 +118,6 @@
       <button class="ctl" id="mute"><span class="ico">&#127908;</span><span class="lbl">Mute</span></button>
       <button class="ctl" id="stopTalk"><span class="ico">&#9197;</span><span class="lbl">Skip</span></button>
       <button class="ctl" id="liveBtn"><span class="ico">&#9889;</span><span class="lbl">Live</span></button>
-      <button class="ctl" id="earsBtn"><span class="ico">&#128066;</span><span class="lbl">Phone</span></button>
       <button class="ctl" id="langBtn"><span class="ico">&#127760;</span><span class="lbl">EN</span></button>
       <button class="ctl danger" id="end"><span class="ico">&#9742;</span><span class="lbl">End</span></button>
     </div>
@@ -191,7 +190,10 @@ let tapToListen = false, modeRunningBeforeLive = null;
 const $ = id => document.getElementById(id);
 function store(k, v) { try { if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v); } catch (e) {} }
 function load(k) { try { return localStorage.getItem(k) || ""; } catch (e) { return ""; } }
-try { liveMode = load("live") === "true"; } catch (e) { liveMode = false; }
+try {
+  if (load("liveDefault") !== "1") { store("live", "true"); store("liveDefault", "1"); }   // v40: Live is the main mode
+  liveMode = load("live") !== "false";
+} catch (e) { liveMode = true; }
 
 function setState(s) {
   logEvent("state:" + s);
@@ -274,10 +276,17 @@ function connect() {
   });
 }
 
+function liveRecentlyFailed() {
+  const t = parseInt(load("liveFailedAt") || "0", 10);
+  return t > 0 && Date.now() - t < 10 * 60 * 1000;   // retry Live 10 minutes after a failure
+}
 function handleLiveError(t) {
-  addChip("Live off: " + (t || "error"), true);
+  store("liveFailedAt", String(Date.now()));
   liveOk = false;
-  setLive(false);
+  setLive(false, true);
+  // iOS may only allow listening after a tap: if the ears do not start by themselves, one tap on this chip does it
+  addChip("Live unavailable, normal mode for now (" + (t || "error") + "). Tap here if I don't hear you.", true,
+          () => { recogWant = true; stopRecog(); startRecog(); render(); });
 }
 
 function armLiveDrop() {
@@ -458,7 +467,6 @@ function setLiveButton() {
   if (b) b.classList.toggle("on", liveMode);
 }
 function setEarsButton() {
-  $("earsBtn").querySelector(".lbl").textContent = earsPhone ? "Phone" : "Mac";
   $("langBtn").querySelector(".lbl").textContent = recogLang === "zh-CN" ? "ZH" : "EN";
   $("langBtn").style.display = (!liveMode && earsPhone) ? "" : "none";
 }
@@ -822,8 +830,9 @@ async function startCall() {
   if (faceP) document.addEventListener("click", armShake, { once: true });   // never stack the motion prompt on Face ID
   else armShake();
   phoneVoice = false; unlockSpeech();   // Qwen voice locked; the Voice button is gone
-  earsPhone = !!SR && load('ears') !== 'mac'; recogLang = load('lang') === 'zh-CN' ? 'zh-CN' : 'en-US';
-  liveMode = load('live') === 'true';
+  earsPhone = !!SR;   // the iPhone listens; Mac ears were removed (v40)
+  recogLang = load('lang') === 'zh-CN' ? 'zh-CN' : 'en-US';
+  liveMode = load('live') !== 'false' && !liveRecentlyFailed();
   setLiveButton(); setEarsButton();
   recogWant = !liveMode && earsPhone; starting = true;
   if (recogWant) startRecog();   // must start inside the tap so iOS asks for permission
@@ -913,9 +922,9 @@ document.addEventListener("visibilitychange", () => { if (document.visibilitySta
 $("login").addEventListener("submit", e => { e.preventDefault(); startCall(); });   // submit (tap or Enter) keeps the user gesture
 $("end").onclick = endCall;
 
-async function setLive(on) {
+async function setLive(on, thisCallOnly) {
   liveMode = !!on;
-  store("live", liveMode ? "true" : "false");
+  if (!thisCallOnly) store("live", liveMode ? "true" : "false");
   setLiveButton();
   setEarsButton();
   if (liveMode) {
@@ -958,20 +967,6 @@ $("liveBtn").onclick = async () => {
   await setLive(!liveMode);
 };
 
-$("earsBtn").onclick = async () => {
-  if (!SR || !inCall) return;
-  if (liveMode) await setLive(false);
-  earsPhone = !earsPhone; store('ears', earsPhone ? 'phone' : 'mac'); setEarsButton();
-  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "ears", mode: earsPhone ? "phone" : "mac" }));
-  if (earsPhone) {
-    try { if (node) node.disconnect(); } catch (e) {} node = null;
-    try { if (stream) stream.getTracks().forEach(t => { t.enabled = false; }); } catch (e) {}
-    recogWant = true; startRecog();
-  } else {
-    recogWant = false; stopRecog();
-    try { await startMic(); } catch (e) { addChip("Microphone unavailable", true); }
-  }
-};
 $("langBtn").onclick = () => {
   recogLang = recogLang === "zh-CN" ? "en-US" : "zh-CN"; store('lang', recogLang); setEarsButton();
   if (recog) { stopRecog(); }   // render restarts it with the new language
