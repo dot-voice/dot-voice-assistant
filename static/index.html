@@ -335,6 +335,7 @@ function onMessage(m) {
   else if (m.type === "handoff") addChip("Handed to " + (m.to || "a session") + ": " + m.text, false);
   else if (m.type === "channels") renderChannels(m.rows);
   else if (m.type === "target") {   // R28: a spoken transfer: the menu and the reconnect value follow the call
+    if (m.chime) playChime();   // R29: a soft ~150 ms chime for a transfer, never on a reconnect resync
     target = m.role || "AUTO"; store("target", target);
     if (m.label && !targets.some(x => x[0] === target)) targets.push([target, m.label]);
     buildTargets(targets);
@@ -507,6 +508,21 @@ function getAudioCtx() {
     ctx.onstatechange = () => { if (ctx && ctx.state === "interrupted") { wakeTries = 0; setTimeout(wakeAudio, 500); } };
   }
   return ctx;
+}
+// R29: a short soft two-note chime (WebAudio, no file) when a transfer lands on a new channel.
+function playChime() {
+  try {
+    const c = getAudioCtx();
+    const t = c.currentTime, g = c.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.12, t + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.15);
+    g.connect(c.destination);
+    [880, 1174.66].forEach((f, i) => {
+      const o = c.createOscillator(); o.type = "sine"; o.frequency.value = f;
+      o.connect(g); o.start(t + i * 0.07); o.stop(t + 0.15);
+    });
+  } catch (e) {}
 }
 async function startAudioOnly() {
   const c = getAudioCtx();

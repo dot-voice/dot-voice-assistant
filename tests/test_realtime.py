@@ -367,6 +367,9 @@ class FakeLiveBridge:
 
 class ServerLiveTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        p = mock.patch.object(server, "SUGGEST_TRANSFERS", False)   # R29 is tested in test_transfer.py; these predate it
+        p.start()
+        self.addCleanup(p.stop)
         FakeLiveBridge.last_instance = None
         self.svc = server.Services(
             server.FakeSpeechToText(""),

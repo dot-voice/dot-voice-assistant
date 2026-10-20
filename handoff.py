@@ -56,7 +56,7 @@ class FileHandoff(Handoff):
         self.teller = teller or tell_role
         self.role = role or HANDOFF_ROLE
 
-    def create(self, task, spoken, role=None):
+    def create(self, task, spoken, role=None, context=None):
         os.makedirs(self.folder, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         rec = {"id": stamp, "task": task, "spoken": spoken, "source": "voice_call", "created": stamp, "posted": False}
@@ -74,6 +74,11 @@ class FileHandoff(Handoff):
             elif len(words) > 480:
                 words = words[:480] + "... (rest of their exact words in %s)" % where
             msg = "%s said by voice (exact words): \"%s\"" % (config.get("owner"), words)
+            if context:   # R29: one extra labelled line; her exact words above are never cut to make room (carry.py cap 600)
+                room = 589 - len(msg)
+                if room >= 40:
+                    msg += "\n" + str(context)[:room]
+                    rec["context"] = str(context)[:room]
             try:
                 rec["told"] = self.teller(target, msg)
                 rec["posted"] = True
@@ -100,7 +105,8 @@ class FakeHandoff(Handoff):
     def __init__(self):
         self.items = []
 
-    def create(self, task, spoken, role=None):
+    def create(self, task, spoken, role=None, context=None):
         self.items.append((task, spoken))
         self.roles = getattr(self, "roles", []) + [role]
+        self.contexts = getattr(self, "contexts", []) + [context]
         return {"id": str(len(self.items)), "task": task, "posted": False}

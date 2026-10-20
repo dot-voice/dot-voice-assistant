@@ -53,9 +53,9 @@ def build_tools():
          "parameters": {"type": "object", "properties": {}}},
         {"type": "function", "name": "transfer_call",
          "description": "The caller asks to be transferred, put through or switched to a channel or session (or back to "
-                        "Dot). Pass the name she said. Never use hand_off for that.",
+                        "Dot, or to the previous channel). Pass the name she said. Never use hand_off for that.",
          "parameters": {"type": "object", "properties": {"channel": {
-             "type": "string", "description": "The channel name as she said it, e.g. vault, website, market watch; \"Dot\" or \"back\" for the front desk."}},
+             "type": "string", "description": "The channel name as she said it, e.g. vault, website, market watch; \"Dot\" or \"back\" for the front desk; \"previous\" for the channel she was on before."}},
              "required": ["channel"]}},
         {"type": "function", "name": "lookup",
          "description": "Look up weather, time, notes, rules, people, properties, or past decisions.",
@@ -76,10 +76,13 @@ def build_instructions(owner, channel=None):
         "in one or two short sentences. For any real work call hand_off. Never claim work is done "
         "unless a tool output says so. If the caller interrupts you, she did not hear the rest of your reply. After hand_off say only who it went to. For status questions "
         "call get_status and read its output word for word. For weather, time, the caller's rules, people, "
-        "properties or past decisions call lookup and answer only from its output; never say you have "
+        "properties or past decisions call lookup and answer only from its output (but finding a property's owner or other client records is real work: hand_off, not lookup); never say you have "
         "no real-time access. What the caller already said in this call counts: answer that from the conversation, "
         "without lookup. Never invent facts. If the caller asks to be transferred, put through or switched to a channel or "
-        "session, or back to Dot, call transfer_call (never hand_off) and say exactly the line its result gives." + note
+        "session, back to Dot, or to the previous channel, call transfer_call (never hand_off) and say exactly the line its result gives. "
+        "If hand_off returns \"not sent yet\" with a question, ask exactly that question and nothing else: on yes call transfer_call, "
+        "on no or anything else call hand_off again. Never offer a transfer on your own, never for status questions, never when the caller "
+        "is already on a channel." + note
     )
 
 

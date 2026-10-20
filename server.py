@@ -34,6 +34,7 @@ from frontdesk import ClaudeFrontDesk, FakeFrontDesk, Reply  # noqa: E402
 from status import direct_status  # noqa: E402
 from version import BUILT, VERSION  # noqa: E402
 from handoff import TARGET_KEYS, TARGETS, FakeHandoff, FileHandoff  # noqa: E402
+from handoff import route as handoff_route  # noqa: E402
 from stt import FakeSpeechToText, WhisperSpeechToText, available_engine  # noqa: E402
 import tts as tts_mod  # noqa: E402
 import updates  # noqa: E402
@@ -61,6 +62,12 @@ class CallState:
         self.handoff_count = 0
         self.target = "AUTO"        # R28: the call's channel (menu pick or spoken transfer); a reconnect keeps it
         self.target_set = False    # True once the server holds the truth (a spoken transfer or a menu pick)
+        self.stack = []             # R29: channels she left, newest last ("previous" pops one; "back to Dot" clears it)
+        self.came_from = "AUTO"     # R29: the channel she was on before the last move
+        self.via_transfer = False   # R29: the current channel was reached by a spoken transfer (hand-offs carry context)
+        self.suggest_asked = set()  # R29: channels Dot already offered a transfer to in this call (once per topic)
+        self.pending_suggestion = None   # R29 normal mode: {"key", "text", "reply", "target"} waiting for her yes / no
+        self.live_suggestion = None      # R29 Live: {"key", "words", "agent"} - the hand-off held back while Dot asks
         self.posted_handoffs = []
         self.pending_handoff = None   # Live: the hand-off still in its correction window
         self.notices = []             # lines Dot must say when she is quiet (a held hand-off that failed)
@@ -71,6 +78,8 @@ class CallState:
         self.last_used = time.time()
 
 CHANNEL_ROWS_MAX = 10
+STACK_MAX = 10
+SUGGEST_TRANSFERS = True   # R29 switch (tests that predate it turn it off)
 # carry.py aliases: a session that answers under the other name still answers that hand-off (R27)
 ROLE_ALIASES = {"CRM": "VAULT", "VAULT": "CRM", "VIDEO": "MW", "MW": "VIDEO"}
 
@@ -264,6 +273,13 @@ class LiveTools:
         if getattr(self.call, "bug", None):
             return "not sent: this is a bug report, say only: noted"
         st = self.call.state
+        moved = await self.guard_transfer(words)   # R29: a transfer phrase is never posted as a task
+        if moved:
+            return moved
+        sug = await self.suggestion_step(words, agent, replaces_waiting)
+        if isinstance(sug, str):
+            return sug
+        words, agent = sug
         p = st.pending_handoff
         if p is not None and not replaces_waiting:
             await self.post_pending(p)   # a new request, not a correction: both go out
@@ -292,22 +308,98 @@ class LiveTools:
         await channels_push(st)
         return "queued for %s, sent in a few seconds unless the caller corrects it" % (agent or "the right session")
 
+    def _zh(self, words=""):
+        return transfer.has_cjk(words) if words else getattr(self.call, "live_lang", "") == "zh-CN"
+
     async def transfer(self, channel, words=""):
-        """R28: transfer_call tool. The tool result tells the model the exact line to say."""
+        """R28: transfer_call tool. The tool result tells the model the exact line to say (and, R29, who it is now)."""
+        zh = self._zh(words)
+        if transfer.is_prev_name(transfer.resolve_words_polite(channel)):
+            res = ("prev",)
+        else:
+            key = self.call.resolve_channel(channel)
+            res = ("to", key) if key else ("unknown", channel)
+        return await self._run(res, zh)
+
+    async def _run(self, res, zh):
         call = self.call
-        zh = transfer.has_cjk(words) if words else getattr(call, "live_lang", "") == "zh-CN"
-        key = call.resolve_channel(channel)
-        if not key:
-            say = transfer.unknown_say(TARGETS, zh)
-            return "unknown channel, target unchanged. Say exactly this and nothing else: \"%s\"" % say
-        await call.set_channel(key)
-        say = transfer.greeting(key, TARGETS, zh)
+        ls, call.state.live_suggestion = call.state.live_suggestion, None
+
+        sent = []
+
+        async def forward(key):
+            if not ls or ls["key"] != key:
+                return False
+            sent.append(key)
+            return await self.send_kept(ls, key)
+
+        kind, say, key = await call.run_plan(res, zh, forward)
+        if ls and not sent:   # she went elsewhere (or nowhere): her kept request still goes out, to where it belonged
+            await self.send_kept(ls)
+        if kind != "moved":
+            return "%s, target unchanged. Say exactly this and nothing else: \"%s\"" % (
+                "no previous channel" if res[0] == "prev" else "unknown channel", say)
         if key == "AUTO":
             note = "The caller is back with you (Dot); handle her requests as before."
         else:
-            note = ("The caller is now on the %s channel; real work goes to %s (hand_off with no agent goes there)."
-                    % (transfer.spoken_label(key, TARGETS), key))
+            name = transfer.spoken_label(key, TARGETS)
+            note = ("You are now the %s line: the caller is on the %s channel; real work goes to %s (hand_off with no agent "
+                    "goes there). Her sessions' replies are spoken when ready." % (name, name, key))
         return "transferred. Say exactly this and nothing else: \"%s\" %s" % (say, note)
+
+    async def send_kept(self, ls, agent=None):
+        """R29: post the request held back by a suggestion (her exact words, R15). Honours the per-call cap; a failure
+        marks the Channels row failed and queues a spoken notice. True when posted."""
+        call, st = self.call, self.call.state
+        agent = agent or ls.get("agent") or ls["key"]
+        row = channel_row_add(st, ls["words"], agent, "waiting")
+        if getattr(call, "handoff_count", 0) >= 6:
+            out = "not sent: limit reached"
+        else:
+            out = await self._post(ls["words"], agent, row)
+        if out.startswith("posted"):
+            return True
+        row["status"] = "failed"
+        await channels_push(st)
+        st.notices.append(transfer.sorry_say(transfer.has_cjk(ls["words"])))
+        return False
+
+    async def guard_transfer(self, words):
+        """R29: hand_off was called with words that are a transfer request (the model picked the wrong tool): do the
+        transfer, post nothing. None when the words are not a transfer."""
+        aliases, titles = self.call.transfer_names()
+        res = transfer.plan(words, TARGETS, aliases, titles)
+        if res is None or res[0] == "unknown":   # "connect with Alex tomorrow about the offer" is still a task
+            return None
+        log_line("live: hand_off with a transfer phrase became a transfer", self.call.svc.turn_log)
+        return await self._run(res, transfer.has_cjk(words))
+
+    async def suggestion_step(self, words, agent, replaces_waiting):
+        """R29: on the front desk, work that belongs to one channel is offered a transfer first (once per channel).
+        Returns a result string (not sent yet: ask), or (words, agent) to carry on - the kept request when she
+        answered no or anything else."""
+        call, st = self.call, self.call.state
+        ls = st.live_suggestion
+        if replaces_waiting and not ls:
+            return words, agent
+        if ls:
+            if transfer.is_yes(words):   # she said yes but the model called hand_off: still a transfer (_run posts the kept request)
+                return await self._run(("to", ls["key"]), self._zh(words))
+            st.live_suggestion = None
+            norm = lambda w: " ".join(str(w).lower().split()).strip(" .,!?")
+            if transfer.is_no(words) or norm(words) == norm(ls["words"]):
+                return ls["words"], agent or ls["agent"]   # her request as she said it (R15), sent as before
+            await self.send_kept(ls)   # anything else is a new request: the kept one still goes out first
+            if replaces_waiting:
+                return words, agent
+        key = call.suggest_key(words, agent)
+        if not key:
+            return words, agent
+        st.suggest_asked.add(key)
+        st.live_suggestion = {"key": key, "words": words, "agent": agent}
+        q = transfer.suggest_say(key, TARGETS, self._zh(words))
+        return ("not sent yet. Ask the caller exactly this and nothing else: \"%s\" If she says yes, call transfer_call with "
+                "channel %s. If she says no or anything else, call hand_off again (her request is kept)." % (q, key))
 
     async def cancel_hand_off(self):
         p, self.call.state.pending_handoff = self.call.state.pending_handoff, None
@@ -341,7 +433,9 @@ class LiveTools:
 
     async def _post(self, words, agent, row=None):
         try:
-            rec = await asyncio.to_thread(self.call.svc.handoff.create, words, words, role=agent)
+            ctx = self.call.warm_context(words)
+            extra = {"context": ctx} if ctx else {}
+            rec = await asyncio.to_thread(self.call.svc.handoff.create, words, words, role=agent, **extra)
         except Exception as e:
             return "not sent: %s" % (str(e) or type(e).__name__)[:120]
         if rec and rec.get("posted"):
@@ -668,20 +762,67 @@ class Call:
         aliases, titles = self.transfer_names()
         return transfer.resolve_words(name, TARGETS, aliases, titles)
 
-    async def send_target(self):
+    async def send_target(self, chime=False):
         key = self.target
         now = self.state.call or self
+        msg = {"type": "target", "role": key, "label": dict(TARGETS).get(key, key)}
+        if chime:
+            msg["chime"] = True   # R29: the page plays a soft chime; a reconnect resync never does
         try:
-            await now.send({"type": "target", "role": key, "label": dict(TARGETS).get(key, key)})
+            await now.send(msg)
         except Exception:
             pass
 
-    async def set_channel(self, key):
+    def _move(self, key, how):
+        """R29: bookkeeping for a channel change. how: "transfer" | "previous" | "menu"."""
+        st = self.state
+        old = st.target
+        if key != old:
+            if how == "previous":
+                pass
+            elif key == "AUTO":
+                st.stack.clear()          # "back to Dot" empties the stack
+            else:
+                st.stack.append(old)
+                del st.stack[:-STACK_MAX]
+            st.came_from = old
+        st.via_transfer = how in ("transfer", "previous") and key not in ("AUTO", "VOICE")
+        st.target = key
+        st.target_set = True
+
+    def pop_previous(self):
+        st = self.state
+        while st.stack:
+            key = st.stack.pop()
+            if key in TARGET_KEYS and key != st.target:
+                return key
+        return None
+
+    async def set_channel(self, key, how="transfer"):
         """Same effect as the menu: the call's channel is KEY (hand-offs go there); the page is told."""
-        self.target = key
-        self.state.target_set = True
+        self._move(key, how)
+        self.state.pending_suggestion = None
         log_line("call: transferred to %s" % key, self.svc.turn_log)
-        await self.send_target()
+        await self.send_target(chime=how in ("transfer", "previous"))
+
+    async def greet(self, key, zh, passed=False):
+        """R29: "Vault here." + where replies are spoken (+ "I passed on your request" after a yes to a suggestion)."""
+        return transfer.greeting(key, TARGETS, zh, passed)
+
+    async def run_plan(self, res, zh, forward=None):
+        """transfer.plan() result -> (kind, line to say, key). kind: "moved" | "unknown" (a prev with nothing to pop is "unknown")."""
+        if res[0] == "unknown":
+            return "unknown", transfer.unknown_say(TARGETS, zh), None
+        if res[0] == "prev":
+            key = self.pop_previous()
+            if key is None:
+                return "unknown", transfer.no_previous_say(zh), None
+            how = "previous"
+        else:
+            key, how = res[1], "transfer"
+        await self.set_channel(key, how)
+        passed = bool(forward and await forward(key))   # a yes to a suggestion also posts her kept request there
+        return "moved", await self.greet(key, zh, passed), key
 
     async def try_transfer(self, text, zh=None):
         """Normal mode: her words ask for a transfer -> the line to say; None when they do not."""
@@ -690,10 +831,47 @@ class Call:
         if res is None:
             return None
         zh = transfer.has_cjk(text) if zh is None else zh
-        if res[0] == "unknown":
-            return transfer.unknown_say(TARGETS, zh)
-        await self.set_channel(res[1])
-        return transfer.greeting(res[1], TARGETS, zh)
+        return (await self.run_plan(res, zh))[1]
+
+    def suggest_key(self, words, agent=None, task=None):
+        """R29: the channel to offer a transfer to, or None. Only on the front desk (AUTO), only for real work whose
+        route() is one specific channel, once per channel per call, never for status questions (R14) or when she
+        already named the channel ("tell the website ...")."""
+        st = self.state
+        if not SUGGEST_TRANSFERS or self.target != "AUTO" or getattr(self, "bug", None):
+            return None
+        role = agent if agent and agent != "AUTO" else handoff_route(task or words, words)
+        key = role if role in TARGET_KEYS else ROLE_ALIASES.get(role)
+        if key not in TARGET_KEYS or key in ("ORG", "VOICE", "AUTO") or key in st.suggest_asked:
+            return None
+        import status as status_mod
+        if status_mod.wants_status(words) or transfer.explicit_addressee(words, key, TARGETS):
+            return None
+        return key
+
+    def warm_context(self, words):
+        """R29: one labelled line for a hand-off posted on a channel reached by a transfer: the last few lines of the call,
+        <= 120 ASCII chars, no phone numbers or e-mails, never Chinese text. None when it does not apply."""
+        st = self.state
+        if not st.via_transfer or self.target in ("AUTO", "VOICE"):
+            return None
+        mine = " ".join(str(words or "").split())
+        lines = [l for l in self.history if " ".join(l["text"].split()) != mine and not transfer.is_suggestion_chatter(l)][-3:]
+        if not lines:
+            return None
+        frm = "front desk" if st.came_from in ("AUTO", "VOICE") else transfer.spoken_label(st.came_from, TARGETS)
+        if any(transfer.has_cjk(l["text"]) for l in lines):
+            body = "(context in Chinese, see voice call)"
+        else:
+            parts = []
+            for l in lines:
+                t = re.sub(r"[\w.+-]+@[\w-]+\.[\w.]+", "[email]", l["text"])
+                t = re.sub(r"\+?\d[\d\-\s().]{6,}\d", "[number]", t)
+                t = " ".join(t.encode("ascii", "ignore").decode().split())
+                if t:
+                    parts.append(("Caller: " if l["role"] == "user" else "Dot: ") + _short(t, 40))
+            body = _short(" / ".join(parts), 120)
+        return ("Context (Dot, from %s): %s" % (frm, body)) if body else None
 
     async def turn(self, pcm, text=None):
         t0 = time.monotonic()
@@ -715,14 +893,18 @@ class Call:
             self.history.pop()   # phone ears joined the interrupted first half with the rest: keep one line
         self.history.append({"role": "user", "text": text})
         await self.send({"type": "transcript", "role": "user", "text": text})
+        pend, self.state.pending_suggestion = self.state.pending_suggestion, None
+        if pend is not None:   # R29: her answer to "Sounds like Vault - want me to transfer you?"
+            if transfer.is_yes(text):
+                await self._say_line(text, await self._yes_transfer(pend, text))
+                return
+            now = time.monotonic()   # no, or anything else: her request goes as before
+            await self._deliver(pend["text"], pend["reply"], pend["target"], now, now, now)
+            if transfer.is_no(text):
+                return
         moved = await self.try_transfer(text)   # R28: "transfer me to vault" is never a hand-off
         if moved is not None:
-            log_line("reply: " + moved[:200], self.svc.turn_log)
-            self.history.append({"role": "assistant", "text": moved})
-            await self.send({"type": "transcript", "role": "assistant", "text": moved})
-            await self.speak(moved)
-            if self.svc.log_calls:
-                self._append_call_log(text, moved)
+            await self._say_line(text, moved)
             return
         asked = text
         target = getattr(self, "target", "AUTO")
@@ -735,18 +917,74 @@ class Call:
         else:
             reply = await asyncio.to_thread(self.svc.frontdesk.reply, list(self.history[:-1]), asked)
         t_fd = time.monotonic()
+        key = None if direct or not reply.handoff else self.suggest_key(text, task=reply.handoff)
+        if key:   # R29: real work for one specific channel: offer the transfer once; the request waits for her answer
+            self.state.suggest_asked.add(key)
+            self.state.pending_suggestion = {"key": key, "text": text, "reply": reply, "target": target}
+            await self._say_line(text, transfer.suggest_say(key, TARGETS, transfer.has_cjk(text)))
+            return
+        await self._deliver(text, reply, target, t0, t_stt, t_fd)
+
+    async def release_suggestions(self):
+        """R29: a question that was never answered must not outlive its mode: post the held request to where it belonged."""
+        st = self.state
+        pend, st.pending_suggestion = st.pending_suggestion, None
+        if pend is not None:
+            try:
+                now = time.monotonic()
+                await self._deliver(pend["text"], pend["reply"], pend["target"], now, now, now)
+            except Exception:
+                pass
+        ls = st.live_suggestion
+        if ls is not None:
+            st.live_suggestion = None
+            try:
+                await LiveTools(self).send_kept(ls)
+            except Exception:
+                pass
+
+    async def _yes_transfer(self, pend, text):
+        """She said yes: transfer, then post the kept request (her exact words, R15) to the new channel."""
+        await self.set_channel(pend["key"])
+        ok = False
+        if pend["reply"].handoff:
+            if self.handoff_count < 6:
+                try:
+                    ok = await self._post_reply(pend["text"], pend["reply"], pend["key"])
+                except Exception:
+                    ok = False
+            if not ok:
+                return transfer.sorry_say(transfer.has_cjk(text))
+        return await self.greet(pend["key"], transfer.has_cjk(text), ok)
+
+    async def _say_line(self, text, line):
+        log_line("reply: " + line[:200], self.svc.turn_log)
+        self.history.append({"role": "assistant", "text": line})
+        await self.send({"type": "transcript", "role": "assistant", "text": line})
+        await self.speak(line)
+        if self.svc.log_calls:
+            self._append_call_log(text, line)
+
+    async def _post_reply(self, text, reply, target):
+        """Post a front-desk hand-off (her exact words) and update the Channels list; returns True when it was posted."""
+        ctx = self.warm_context(text)
+        extra = {"context": ctx} if ctx else {}
+        rec = await asyncio.to_thread(self.svc.handoff.create, reply.handoff, text, target, **extra)
+        ok = bool(rec and rec.get("posted"))
+        if ok:
+            self.posted_handoffs.append({"to": rec.get("to", target), "words": text})
+        row = channel_row_add(self.state, text, (rec or {}).get("to") or target, "sent" if ok else "failed")
+        row["sent_at"] = time.time()
+        await self.send({"type": "handoff", "id": rec.get("id", ""), "text": reply.handoff, "to": rec.get("to", "")})
+        await channels_push(self.state)
+        return ok
+
+    async def _deliver(self, text, reply, target, t0, t_stt, t_fd):
         say = reply.say
         if reply.handoff:
             await self.send({"type": "status", "state": "working"})
             try:
-                rec = await asyncio.to_thread(self.svc.handoff.create, reply.handoff, text, target)
-                ok = bool(rec and rec.get("posted"))
-                if ok:
-                    self.posted_handoffs.append({"to": rec.get("to", target), "words": text})
-                row = channel_row_add(self.state, text, (rec or {}).get("to") or target, "sent" if ok else "failed")
-                row["sent_at"] = time.time()
-                await self.send({"type": "handoff", "id": rec.get("id", ""), "text": reply.handoff, "to": rec.get("to", "")})
-                await channels_push(self.state)
+                await self._post_reply(text, reply, target)
             except Exception:
                 say = "Sorry, I could not hand that over. Please try again."
         log_line("reply: " + say[:200].replace("\n", " "), self.svc.turn_log)   # what the assistant said (not what the caller said), to debug refusals
@@ -900,6 +1138,7 @@ class Call:
                         continue
                     kind = data.get("type")
                     if kind == "live":
+                        await self.release_suggestions()
                         if data.get("lang") in ("zh-CN", "en-US"):
                             self.live_lang = data["lang"]
                         if data.get("on"):
@@ -952,8 +1191,7 @@ class Call:
                     elif kind == "ears":
                         self.ears = "phone" if data.get("mode") == "phone" else "mac"
                     elif kind == "target":
-                        self.target = data.get("role") if data.get("role") in TARGET_KEYS else "AUTO"
-                        self.state.target_set = True
+                        self._move(data.get("role") if data.get("role") in TARGET_KEYS else "AUTO", "menu")
                     elif kind == "voice":
                         self.phone_voice = data.get("engine") == "phone"
                     elif kind == "passkey_register_options" and self.svc.passkeys and getattr(self, "signed_with_pin", False):
@@ -992,6 +1230,7 @@ class Call:
                 log_line("live: off", self.svc.turn_log)
             if not self.replaced:
                 await LiveTools(self).post_pending()
+                await self.release_suggestions()
             if self.state.call is self:
                 self.state.call = None
                 self.state.last_used = time.time()
