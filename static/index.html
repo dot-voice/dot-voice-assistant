@@ -334,6 +334,11 @@ function onMessage(m) {
   } else if (m.type === "transcript") addMsg(m.role, m.text);
   else if (m.type === "handoff") addChip("Handed to " + (m.to || "a session") + ": " + m.text, false);
   else if (m.type === "channels") renderChannels(m.rows);
+  else if (m.type === "target") {   // R28: a spoken transfer: the menu and the reconnect value follow the call
+    target = m.role || "AUTO"; store("target", target);
+    if (m.label && !targets.some(x => x[0] === target)) targets.push([target, m.label]);
+    buildTargets(targets);
+  }
   else if (m.type === "say") speakText(m.text);
   else if (m.type === "passkey_options") offerFaceId(m.options);
   else if (m.type === "voice_used") addChip("Qwen was slow, so the Mac voice spoke this time.", false);

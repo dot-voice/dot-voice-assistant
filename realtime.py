@@ -51,6 +51,12 @@ def build_tools():
         {"type": "function", "name": "cancel_hand_off",
          "description": "The caller says not to send the hand-off just made.",
          "parameters": {"type": "object", "properties": {}}},
+        {"type": "function", "name": "transfer_call",
+         "description": "The caller asks to be transferred, put through or switched to a channel or session (or back to "
+                        "Dot). Pass the name she said. Never use hand_off for that.",
+         "parameters": {"type": "object", "properties": {"channel": {
+             "type": "string", "description": "The channel name as she said it, e.g. vault, website, market watch; \"Dot\" or \"back\" for the front desk."}},
+             "required": ["channel"]}},
         {"type": "function", "name": "lookup",
          "description": "Look up weather, time, notes, rules, people, properties, or past decisions.",
          "parameters": {"type": "object", "properties": {"question": {"type": "string", "description": "What to look up."}}, "required": ["question"]}},
@@ -60,7 +66,11 @@ def build_tools():
 TOOLS = build_tools()
 
 
-def build_instructions(owner):
+def build_instructions(owner, channel=None):
+    note = ""
+    if channel and channel not in ("AUTO", "VOICE"):   # R28: she was transferred to a channel (a new Live session keeps it)
+        note = (f" The caller is on the {channel} channel; real work goes to {channel} (hand_off with no agent goes there). "
+                "To change channel call transfer_call.")
     return (
         f"You are the assistant of {owner} on a hands-free call. Reply in the language spoken, "
         "in one or two short sentences. For any real work call hand_off. Never claim work is done "
@@ -68,7 +78,8 @@ def build_instructions(owner):
         "call get_status and read its output word for word. For weather, time, the caller's rules, people, "
         "properties or past decisions call lookup and answer only from its output; never say you have "
         "no real-time access. What the caller already said in this call counts: answer that from the conversation, "
-        "without lookup. Never invent facts."
+        "without lookup. Never invent facts. If the caller asks to be transferred, put through or switched to a channel or "
+        "session, or back to Dot, call transfer_call (never hand_off) and say exactly the line its result gives." + note
     )
 
 
@@ -418,6 +429,11 @@ class LiveBridge:
             if str(out).startswith(("posted", "queued")):   # a correction ("updated") is not a new hand-off
                 self.handoff_count += 1
             return out
+        elif name == "transfer_call":
+            fn = getattr(self.tools_impl, "transfer", None)
+            if not fn:
+                return "failed: transfers are not available"
+            return await fn(str(args.get("channel") or ""), (self._turn_transcript or "").strip())
         elif name == "cancel_hand_off":
             cancel = getattr(self.tools_impl, "cancel_hand_off", None)
             return await cancel() if cancel else "nothing to cancel"

@@ -39,6 +39,7 @@ import tts as tts_mod  # noqa: E402
 import updates  # noqa: E402
 from tts import FakeTextToSpeech, default_tts, find_and_store_qwen_key, QwenTextToSpeech  # noqa: E402
 import realtime  # noqa: E402
+import transfer  # noqa: E402
 
 PORT = 8770
 AUTH_TIMEOUT_S = 20
@@ -58,6 +59,8 @@ class CallState:
     def __init__(self):
         self.history = []          # {"role", "text"} plus "turn" / "reply" tags from Live
         self.handoff_count = 0
+        self.target = "AUTO"        # R28: the call's channel (menu pick or spoken transfer); a reconnect keeps it
+        self.target_set = False    # True once the server holds the truth (a spoken transfer or a menu pick)
         self.posted_handoffs = []
         self.pending_handoff = None   # Live: the hand-off still in its correction window
         self.notices = []             # lines Dot must say when she is quiet (a held hand-off that failed)
@@ -269,7 +272,7 @@ class LiveTools:
             p["task"].cancel()
             if words and words not in p["words"]:
                 p["words"] = (p["words"] + " " + words).strip()
-            p["agent"] = agent or p["agent"]
+            p["agent"] = (agent if agent and agent != "AUTO" else None) or p["agent"]
             p["task"] = asyncio.create_task(self._post_later(p))
             row = p.get("row")
             if row:
@@ -279,12 +282,32 @@ class LiveTools:
             return "updated: the waiting hand-off now goes to %s" % (p["agent"] or "the right session")
         if getattr(self.call, "handoff_count", 0) >= 6:
             return "limit reached, tell the caller to use the menu"
+        if not agent or agent == "AUTO":   # R28: on a channel, work goes there unless the caller names another
+            ch = getattr(self.call, "target", "AUTO")
+            agent = ch if ch not in ("AUTO", "VOICE") else agent
         p = {"words": words, "agent": agent}
         p["row"] = channel_row_add(st, words, agent, "waiting")
         p["task"] = asyncio.create_task(self._post_later(p))
         st.pending_handoff = p
         await channels_push(st)
         return "queued for %s, sent in a few seconds unless the caller corrects it" % (agent or "the right session")
+
+    async def transfer(self, channel, words=""):
+        """R28: transfer_call tool. The tool result tells the model the exact line to say."""
+        call = self.call
+        zh = transfer.has_cjk(words) if words else getattr(call, "live_lang", "") == "zh-CN"
+        key = call.resolve_channel(channel)
+        if not key:
+            say = transfer.unknown_say(TARGETS, zh)
+            return "unknown channel, target unchanged. Say exactly this and nothing else: \"%s\"" % say
+        await call.set_channel(key)
+        say = transfer.greeting(key, TARGETS, zh)
+        if key == "AUTO":
+            note = "The caller is back with you (Dot); handle her requests as before."
+        else:
+            note = ("The caller is now on the %s channel; real work goes to %s (hand_off with no agent goes there)."
+                    % (transfer.spoken_label(key, TARGETS), key))
+        return "transferred. Say exactly this and nothing else: \"%s\" %s" % (say, note)
 
     async def cancel_hand_off(self):
         p, self.call.state.pending_handoff = self.call.state.pending_handoff, None
@@ -384,6 +407,14 @@ class Call:
         self.svc.last_call = self   # tests reach the live Call through this
 
     @property
+    def target(self):
+        return self.state.target
+
+    @target.setter
+    def target(self, key):
+        self.state.target = key
+
+    @property
     def handoff_count(self):
         return self.state.handoff_count
 
@@ -468,7 +499,7 @@ class Call:
             bridge = cls(
                 self._live_out,
                 LiveTools(self),
-                realtime.build_instructions(config.get("owner")),
+                realtime.build_instructions(config.get("owner"), self.target),
                 transcribe=transcribe_fn,
                 on_closed=lambda h=holder: self._on_live_closed(h[0] if h else None),
                 turn_log=self.svc.turn_log,
@@ -595,7 +626,8 @@ class Call:
             locked = self.svc.guard.locked_for()   # nothing to check (e.g. stale token only): refuse, do not count
         self.phone_voice = msg.get("voice") == "phone"
         self.ears = "phone" if msg.get("ears") == "phone" else "mac"
-        self.target = msg.get("target") if msg.get("target") in TARGET_KEYS else "AUTO"
+        if not self.state.target_set:   # R28: after a spoken transfer the server's channel wins over the page's old pick
+            self.target = msg.get("target") if msg.get("target") in TARGET_KEYS else "AUTO"
         if not ok:
             await self.send({"type": "auth_retry"} if retry else {"type": "auth_fail", "locked_s": locked,
                                                                   "face": bool(msg.get("passkey")) and not pin})
@@ -613,10 +645,55 @@ class Call:
         self.state.call = self
         if self.state.channel_rows:
             await channels_push(self.state)   # R27: the list survives a reconnect
+        if self.state.target_set:
+            await self.send_target()          # R28: the menu and the call agree after a reconnect
         self.keep = asyncio.create_task(self._keepalive())
         self.upd = asyncio.create_task(self._updates_loop())
         await self.send({"type": "status", "state": "listening"})
         return True
+
+    # ---- R28: call-center transfers ----
+    def transfer_names(self):
+        """(aliases, titles) from roles_json at run time; both empty when the file is missing."""
+        aliases, titles = [], {}
+        try:
+            import status as status_mod
+            titles = status_mod.session_titles()
+            aliases = json.load(open(status_mod.ROLES_JSON)).get("_aliases") or []
+        except Exception:
+            pass
+        return aliases, titles
+
+    def resolve_channel(self, name):
+        aliases, titles = self.transfer_names()
+        return transfer.resolve_words(name, TARGETS, aliases, titles)
+
+    async def send_target(self):
+        key = self.target
+        now = self.state.call or self
+        try:
+            await now.send({"type": "target", "role": key, "label": dict(TARGETS).get(key, key)})
+        except Exception:
+            pass
+
+    async def set_channel(self, key):
+        """Same effect as the menu: the call's channel is KEY (hand-offs go there); the page is told."""
+        self.target = key
+        self.state.target_set = True
+        log_line("call: transferred to %s" % key, self.svc.turn_log)
+        await self.send_target()
+
+    async def try_transfer(self, text, zh=None):
+        """Normal mode: her words ask for a transfer -> the line to say; None when they do not."""
+        aliases, titles = self.transfer_names()
+        res = transfer.plan(text, TARGETS, aliases, titles)
+        if res is None:
+            return None
+        zh = transfer.has_cjk(text) if zh is None else zh
+        if res[0] == "unknown":
+            return transfer.unknown_say(TARGETS, zh)
+        await self.set_channel(res[1])
+        return transfer.greeting(res[1], TARGETS, zh)
 
     async def turn(self, pcm, text=None):
         t0 = time.monotonic()
@@ -638,6 +715,15 @@ class Call:
             self.history.pop()   # phone ears joined the interrupted first half with the rest: keep one line
         self.history.append({"role": "user", "text": text})
         await self.send({"type": "transcript", "role": "user", "text": text})
+        moved = await self.try_transfer(text)   # R28: "transfer me to vault" is never a hand-off
+        if moved is not None:
+            log_line("reply: " + moved[:200], self.svc.turn_log)
+            self.history.append({"role": "assistant", "text": moved})
+            await self.send({"type": "transcript", "role": "assistant", "text": moved})
+            await self.speak(moved)
+            if self.svc.log_calls:
+                self._append_call_log(text, moved)
+            return
         asked = text
         target = getattr(self, "target", "AUTO")
         if target not in ("AUTO", "VOICE"):   # the caller picked a session in the menu: the front desk knows who real work goes to
@@ -867,6 +953,7 @@ class Call:
                         self.ears = "phone" if data.get("mode") == "phone" else "mac"
                     elif kind == "target":
                         self.target = data.get("role") if data.get("role") in TARGET_KEYS else "AUTO"
+                        self.state.target_set = True
                     elif kind == "voice":
                         self.phone_voice = data.get("engine") == "phone"
                     elif kind == "passkey_register_options" and self.svc.passkeys and getattr(self, "signed_with_pin", False):
