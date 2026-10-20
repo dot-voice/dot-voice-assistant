@@ -930,9 +930,9 @@ class Call:
         st = self.state
         pend, st.pending_suggestion = st.pending_suggestion, None
         if pend is not None:
-            try:
-                now = time.monotonic()
-                await self._deliver(pend["text"], pend["reply"], pend["target"], now, now, now)
+            try:   # post only, never speak: Live may be starting and Dot never talks over it (R8)
+                if pend["reply"].handoff:
+                    await self._post_reply(pend["text"], pend["reply"], pend["target"])
             except Exception:
                 pass
         ls = st.live_suggestion
