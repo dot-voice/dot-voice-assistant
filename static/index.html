@@ -26,6 +26,15 @@
   .chip { align-self:center; font-size:13px; padding:6px 12px; border-radius:14px; background:#2a2418; color:var(--amber); }
   .chip.err { background:#2b1a19; color:var(--red); }
   button.chip { width:auto; max-width:none; border:0; font-size:14px; font-weight:600; padding:9px 16px; }
+  /* R27 Channels list */
+  #channels { display:flex; flex-direction:column; gap:3px; max-height:84px; overflow-y:auto; padding:4px 2px; font-size:12px; color:var(--muted); }
+  #channels.hidden { display:none; }
+  #channels .ch { display:flex; gap:6px; align-items:baseline; min-width:0; }
+  #channels .chl { color:var(--text); font-weight:600; flex:none; }
+  #channels .chs { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #channels .cht { flex:none; padding:1px 8px; border-radius:10px; background:#1d2027; }
+  #channels .cht.sent { color:var(--blue); } #channels .cht.replied { color:var(--green); }
+  #channels .cht.waiting { color:var(--amber); } #channels .cht.cancelled { color:var(--muted); } #channels .cht.failed { color:var(--red); }
   /* Dot */
   /* in a call the header hides: Dot's name and status sit beside the face */
   #top { display:flex; align-items:center; gap:14px; padding:12px 4px 6px; }
@@ -112,6 +121,7 @@
     <button id="toBtn" type="button" aria-label="Choose who you talk to">&#9776; <span id="toLbl">Auto</span></button></div>
   <div id="toMenu" class="hidden"><div id="toList"></div></div>
   <div id="log"></div>
+  <div id="channels" class="hidden"></div>
   <div id="dbg" style="font:11px monospace;opacity:.6;padding:4px 12px"></div>
   <div id="stage">
     <div id="controls">
@@ -228,6 +238,18 @@ function addMsg(role, text) {
   d.className = "msg " + role; d.textContent = text;
   $("log").appendChild(d); $("log").scrollTop = $("log").scrollHeight;
 }
+function renderChannels(rows) {
+  const box = $("channels");
+  box.textContent = "";
+  (rows || []).forEach(r => {
+    const d = document.createElement("div"); d.className = "ch";
+    const l = document.createElement("span"); l.className = "chl"; l.textContent = r.label;
+    const t = document.createElement("span"); t.className = "chs"; t.textContent = r.status === "replied" && r.reply ? r.reply : r.snippet;
+    const s = document.createElement("span"); s.className = "cht " + r.status; s.textContent = r.status;
+    d.appendChild(l); d.appendChild(t); d.appendChild(s); box.appendChild(d);
+  });
+  box.classList.toggle("hidden", !(rows && rows.length));
+}
 function addChip(text, err, onClick) {
   const d = document.createElement("div");
   d.className = "chip" + (err ? " err" : ""); d.textContent = text;
@@ -311,6 +333,7 @@ function onMessage(m) {
     }
   } else if (m.type === "transcript") addMsg(m.role, m.text);
   else if (m.type === "handoff") addChip("Handed to " + (m.to || "a session") + ": " + m.text, false);
+  else if (m.type === "channels") renderChannels(m.rows);
   else if (m.type === "say") speakText(m.text);
   else if (m.type === "passkey_options") offerFaceId(m.options);
   else if (m.type === "voice_used") addChip("Qwen was slow, so the Mac voice spoke this time.", false);

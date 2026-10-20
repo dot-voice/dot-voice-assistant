@@ -473,6 +473,86 @@ class ServerLiveTest(unittest.IsolatedAsyncioTestCase):
         await tools.post_pending()
         self.assertEqual(len(call.state.notices), 1)
 
+    async def test_channels_rows_waiting_sent_replied(self):
+        # R27: waiting -> sent -> replied; the list is sent to the phone on every change.
+        import updates
+        folder = tempfile.mkdtemp()
+        ws = FakeCallWS([])
+        call = server.Call(ws, self.svc)
+        call.state.call = call
+        tools = server.LiveTools(call)
+        self.svc.handoff.create = mock.Mock(return_value={"posted": True, "to": "VAULT", "id": "1"})
+
+        def last_rows():
+            msgs = [json.loads(m) for m in ws.sent if isinstance(m, str)]
+            return [m for m in msgs if m.get("type") == "channels"][-1]["rows"]
+
+        with mock.patch.object(server, "HANDOFF_HOLD_S", 0.1):
+            await tools.hand_off("Please check Main Street for Alex and tell me what the owner paid last time.", "CRM")
+            rows = last_rows()
+            self.assertEqual([r["status"] for r in rows], ["waiting"])
+            self.assertLessEqual(len(rows[0]["snippet"]), 40)
+            await asyncio.sleep(0.25)
+        self.assertEqual([r["status"] for r in last_rows()], ["sent"])
+        # an older update does not count; an update from the aliased role after the post is the reply
+        updates.post("VAULT", "Old news.", folder=folder)
+        path = os.path.join(folder, os.listdir(folder)[0])
+        with open(path) as f:
+            rec = json.load(f)
+        rec["created"] = call.state.channel_rows[0]["sent_at"] - 100
+        self.assertFalse(server.channel_replies(call.state, [(path, rec)]))
+        rec["created"] = time.time() + 1
+        rec["from"] = "VAULT"
+        long_text = "The owner paid 1 dollar. " * 10
+        rec["text"] = long_text
+        self.assertTrue(server.channel_replies(call.state, [(path, rec)]))
+        await server.channels_push(call.state)
+        row = last_rows()[0]
+        self.assertEqual(row["status"], "replied")
+        self.assertLessEqual(len(row["reply"]), 60)
+        # the same update never answers a second hand-off
+        call.state.channel_rows.append(dict(call.state.channel_rows[0], id="x", status="sent", reply="", sent_at=0))
+        call.state.channel_rows[1].pop("upd", None)
+        self.assertFalse(server.channel_replies(call.state, [(path, rec)]))
+
+    async def test_channels_rows_cancelled_and_failed(self):
+        # R27
+        ws = FakeCallWS([])
+        call = server.Call(ws, self.svc)
+        call.state.call = call
+        tools = server.LiveTools(call)
+        await tools.hand_off("Call Alex.", "CRM")
+        await tools.cancel_hand_off()
+        self.assertEqual([r["status"] for r in call.state.channel_rows], ["cancelled"])
+        self.svc.handoff.create = mock.Mock(return_value={"posted": False, "post_error": "down"})
+        await tools.hand_off("Call Sam.", "CRM")
+        await tools.post_pending()
+        self.assertEqual([r["status"] for r in call.state.channel_rows], ["cancelled", "failed"])
+        # a correction changes the waiting row's label and words, not the row count
+        await tools.hand_off("Ask about Main Street.", "MW")
+        await tools.hand_off("No, I meant CRM.", "CRM", replaces_waiting=True)
+        self.assertEqual(len(call.state.channel_rows), 3)
+        self.assertEqual(call.state.channel_rows[2]["label"], "CRM")
+        await tools.cancel_hand_off()
+        for i in range(12):
+            server.channel_row_add(call.state, "w%d" % i, "CRM", "sent")
+        self.assertEqual(len(call.state.channel_rows), server.CHANNEL_ROWS_MAX)
+
+    async def test_channels_rows_resent_after_reconnect(self):
+        # R27: the rows live on the shared CallState; the new line gets them right after auth_ok.
+        old = server.Call(FakeCallWS([]), self.svc)
+        server.channel_row_add(old.state, "Call Alex.", "CRM", "sent")
+        new_ws = FakeCallWS([])
+        new = server.Call(new_ws, self.svc)
+        new.state = old.state            # what the resume token does
+        new.history = new.state.history
+        new.state.call = new
+        await server.channels_push(new.state)
+        msgs = [json.loads(m) for m in new_ws.sent if isinstance(m, str)]
+        self.assertEqual(msgs[-1]["type"], "channels")
+        self.assertEqual(msgs[-1]["rows"][0]["status"], "sent")
+        self.assertNotIn("sent_at", msgs[-1]["rows"][0])
+
     async def test_new_live_session_never_overwrites_older_lines(self):
         # R23: each Live session numbers its lines from a new base, so a restart (ZH/EN, reconnect) adds lines.
         call = server.Call(FakeCallWS([]), self.svc)

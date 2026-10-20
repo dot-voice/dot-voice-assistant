@@ -61,10 +61,65 @@ class CallState:
         self.posted_handoffs = []
         self.pending_handoff = None   # Live: the hand-off still in its correction window
         self.notices = []             # lines Dot must say when she is quiet (a held hand-off that failed)
+        self.channel_rows = []        # R27: one row per hand-off of this call, shown on the page (max CHANNEL_ROWS_MAX)
         self.tag_base = 0             # each Live session numbers its lines from here (no clash across sessions)
         self.tokens = set()        # every reconnect token issued in this call
         self.call = None           # the Call using it now
         self.last_used = time.time()
+
+CHANNEL_ROWS_MAX = 10
+# carry.py aliases: a session that answers under the other name still answers that hand-off (R27)
+ROLE_ALIASES = {"CRM": "VAULT", "VAULT": "CRM", "VIDEO": "MW", "MW": "VIDEO"}
+
+
+def _short(text, n):
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= n else text[:n - 3].rstrip() + "..."
+
+
+def channel_row_add(st, words, agent, status):
+    """R27: add a row to the call's Channels list (newest last, at most CHANNEL_ROWS_MAX)."""
+    key = agent if agent else "AUTO"
+    row = {"id": secrets.token_hex(4), "key": key, "label": dict(TARGETS).get(key, key),
+           "snippet": _short(words, 40), "status": status, "reply": "", "sent_at": 0.0}
+    st.channel_rows.append(row)
+    del st.channel_rows[:-CHANNEL_ROWS_MAX]
+    return row
+
+
+def channel_rows_public(st):
+    return [{k: r[k] for k in ("id", "label", "snippet", "status", "reply")} for r in st.channel_rows]
+
+
+async def channels_push(st):
+    """R27: send the list to the phone's current line (after a reconnect that is state.call). Never raises."""
+    now = st.call
+    if now is None:
+        return
+    try:
+        await now.send({"type": "channels", "rows": channel_rows_public(st)})
+    except Exception:
+        pass
+
+
+def channel_replies(st, items):
+    """R27: a session update (updates.pending items) posted after a hand-off was sent marks its row 'replied'.
+    One update answers one row (the oldest sent one for that role or its alias). Returns True if a row changed."""
+    changed = False
+    for path, rec in items:
+        if any(r.get("upd") == path for r in st.channel_rows):
+            continue
+        role = str(rec.get("from", "")).upper()
+        keys = {role, ROLE_ALIASES.get(role, role)}
+        created = float(rec.get("created", 0))
+        for r in st.channel_rows:
+            if r["status"] == "sent" and r["key"] in keys and created >= r["sent_at"]:
+                r["status"], r["reply"], r["upd"] = "replied", _short(rec.get("text", ""), 60), path
+                changed = True
+                break
+    return changed
+
+
 PIN_FILE = os.path.join(HERE, "pin.txt")
 TURN_LOG = os.path.join(HERE, "logs", "turns.log")
 CALL_LOG_DIR = os.path.join(HERE, "logs", "calls")
@@ -216,12 +271,19 @@ class LiveTools:
                 p["words"] = (p["words"] + " " + words).strip()
             p["agent"] = agent or p["agent"]
             p["task"] = asyncio.create_task(self._post_later(p))
+            row = p.get("row")
+            if row:
+                row.update(key=p["agent"] or "AUTO", label=dict(TARGETS).get(p["agent"] or "AUTO", p["agent"] or "AUTO"),
+                           snippet=_short(p["words"], 40))
+                await channels_push(st)
             return "updated: the waiting hand-off now goes to %s" % (p["agent"] or "the right session")
         if getattr(self.call, "handoff_count", 0) >= 6:
             return "limit reached, tell the caller to use the menu"
         p = {"words": words, "agent": agent}
+        p["row"] = channel_row_add(st, words, agent, "waiting")
         p["task"] = asyncio.create_task(self._post_later(p))
         st.pending_handoff = p
+        await channels_push(st)
         return "queued for %s, sent in a few seconds unless the caller corrects it" % (agent or "the right session")
 
     async def cancel_hand_off(self):
@@ -229,6 +291,9 @@ class LiveTools:
         if p is None:
             return "nothing to cancel: the last hand-off was already sent"
         p["task"].cancel()
+        if p.get("row"):
+            p["row"]["status"] = "cancelled"
+            await channels_push(self.call.state)
         log_line("live: hand-off cancelled before sending", self.call.svc.turn_log)
         return "cancelled, nothing was sent"
 
@@ -243,12 +308,15 @@ class LiveTools:
         if p is None or st.pending_handoff is not p:
             return
         st.pending_handoff = None
-        out = await self._post(p["words"], p["agent"])
+        out = await self._post(p["words"], p["agent"], p.get("row"))
+        if p.get("row") and not out.startswith("posted"):
+            p["row"]["status"] = "failed"
+            await channels_push(st)
         if not out.startswith("posted"):
             log_line("live: held hand-off failed", self.call.svc.turn_log)
             st.notices.append("Sorry, that hand-off did not go through. Please say it again.")   # said when she is quiet
 
-    async def _post(self, words, agent):
+    async def _post(self, words, agent, row=None):
         try:
             rec = await asyncio.to_thread(self.call.svc.handoff.create, words, words, role=agent)
         except Exception as e:
@@ -256,6 +324,10 @@ class LiveTools:
         if rec and rec.get("posted"):
             self.call.handoff_count = getattr(self.call, "handoff_count", 0) + 1
             self.call.posted_handoffs.append({"to": rec.get("to", ""), "words": words})
+            if row is not None:
+                to = rec.get("to") or row["key"]
+                row.update(status="sent", sent_at=time.time(), key=to, label=dict(TARGETS).get(to, to))
+                await channels_push(self.call.state)
             now = getattr(self.call.state, "call", None) or self.call   # after a reconnect: the phone's current line
             try:
                 await now.send({"type": "handoff", "id": rec.get("id", ""), "text": words, "to": rec.get("to", "")})
@@ -539,6 +611,8 @@ class Call:
         await self.send({"type": "auth_ok", "version": VERSION, "resume": token, "targets": TARGETS,
                          "passkeys": self.svc.passkeys.count() if self.svc.passkeys else -1})
         self.state.call = self
+        if self.state.channel_rows:
+            await channels_push(self.state)   # R27: the list survives a reconnect
         self.keep = asyncio.create_task(self._keepalive())
         self.upd = asyncio.create_task(self._updates_loop())
         await self.send({"type": "status", "state": "listening"})
@@ -580,9 +654,13 @@ class Call:
             await self.send({"type": "status", "state": "working"})
             try:
                 rec = await asyncio.to_thread(self.svc.handoff.create, reply.handoff, text, target)
-                if rec and rec.get("posted"):
+                ok = bool(rec and rec.get("posted"))
+                if ok:
                     self.posted_handoffs.append({"to": rec.get("to", target), "words": text})
+                row = channel_row_add(self.state, text, (rec or {}).get("to") or target, "sent" if ok else "failed")
+                row["sent_at"] = time.time()
                 await self.send({"type": "handoff", "id": rec.get("id", ""), "text": reply.handoff, "to": rec.get("to", "")})
+                await channels_push(self.state)
             except Exception:
                 say = "Sorry, I could not hand that over. Please try again."
         log_line("reply: " + say[:200].replace("\n", " "), self.svc.turn_log)   # what the assistant said (not what the caller said), to debug refusals
@@ -640,10 +718,14 @@ class Call:
         while True:
             try:
                 busy = (self.task is not None and not self.task.done()) or (self.live is not None and getattr(self.live, "busy", getattr(self.live, "response_active", False)))
+                open_rows = any(r["status"] == "sent" for r in self.state.channel_rows)
+                items = await asyncio.to_thread(updates.pending, self.svc.updates_folder) \
+                    if (open_rows or (not busy and not self.state.notices)) else []
+                if open_rows and channel_replies(self.state, items):
+                    await channels_push(self.state)   # R27: shown even while Dot is busy; speaking is unchanged (R8, R16)
                 if not busy and self.state.notices:
                     self.task = asyncio.create_task(self._say_update(self.state.notices.pop(0)))
                 elif not busy:
-                    items = await asyncio.to_thread(updates.pending, self.svc.updates_folder)
                     if items:
                         path, rec = items[0]
                         self.task = asyncio.create_task(self._say_update(updates.spoken_line(rec), path, rec))
