@@ -598,6 +598,44 @@ class LiveTools:
         task.add_done_callback(st.ask_tasks.discard)
         return "Asking %s now, the answer will be spoken in a few seconds." % key.capitalize()
 
+    SEND_MAX_CHARS = 1000
+    SEND_MAX_PER_CALL = 10
+
+    @staticmethod
+    def build_phone_message(kind, text):
+        """R44: the text of the Telegram message, or None for a bad kind / empty text."""
+        text = " ".join(str(text or "").split())
+        if not text or kind not in ("directions", "note"):
+            return None
+        if kind == "directions":
+            return "Directions to %s\nhttps://www.google.com/maps/dir/?api=1&destination=%s" % (text, urllib.parse.quote(text, safe=""))
+        return text
+
+    async def send_to_phone(self, kind, text):
+        """R44 (P26): one Telegram message to her own chat. Never raises; the result text is what Dot says. The message text
+        is never logged, only kind and ok."""
+        st = self.call.state
+        kind = str(kind or "").strip().lower()
+        ok = False
+        try:
+            if len(str(text or "")) > self.SEND_MAX_CHARS:
+                out = "Too long to send (max %d characters), ask the caller for a shorter version." % self.SEND_MAX_CHARS
+            elif getattr(st, "phone_sends", 0) >= self.SEND_MAX_PER_CALL:
+                out = "Limit reached: %d messages already sent on this call." % self.SEND_MAX_PER_CALL
+            else:
+                msg = self.build_phone_message(kind, text)
+                if msg is None:
+                    out = "Nothing to send: need kind directions or note and some text."
+                else:
+                    ok = bool(await asyncio.to_thread(callrecap.send_telegram, msg, config.get("call_recap_telegram_chat_id")))
+                    if ok:
+                        st.phone_sends = getattr(st, "phone_sends", 0) + 1
+                    out = "Sent to your Telegram." if ok else "Could not send to Telegram, tell the caller it failed."
+        except Exception:
+            out = "Could not send to Telegram, tell the caller it failed."
+        log_line("live_tool=send_to_phone kind=%s ok=%s" % (kind or "-", "yes" if ok else "no"), self.call.svc.turn_log)
+        return out
+
     async def _ask_model_bg(self, key, question):
         st = self.call.state
         status, text, ms = await askmodel.ask(key, question, list(st.history))

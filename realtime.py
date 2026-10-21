@@ -82,6 +82,16 @@ def build_tools():
              "model": {"type": "string", "description": "Opus, Sonnet or Haiku, as the caller named it; Opus if none."},
              "question": {"type": "string", "description": "The question to put to that model, complete in itself."}},
              "required": ["question"]}},
+        {"type": "function", "name": "send_to_phone",
+         "description": "Send one text message to the caller's own Telegram during the call, because a phone call cannot show a map "
+                        "or a list. Call it when the caller says send me that, text me the address, send me directions, or send it "
+                        "to my phone. kind directions: text is the destination address; she gets a Google Maps navigation link. "
+                        "kind note: text is plain text such as listing facts, a phone number or a short summary (links stay tappable). "
+                        "Then say only that it was sent to her Telegram.",
+         "parameters": {"type": "object", "properties": {
+             "kind": {"type": "string", "enum": ["directions", "note"], "description": "directions for an address, note for anything else."},
+             "text": {"type": "string", "description": "The address (directions) or the text to send (note), at most 1000 characters."}},
+             "required": ["kind", "text"]}},
     ]
 
 
@@ -570,6 +580,13 @@ class LiveBridge:
             if not ask_fn:
                 return "Asking another model is not available."
             return await ask_fn(args.get("model"), q)
+        elif name == "send_to_phone":   # R44: Telegram message to her own chat; private, so sign-in is required
+            if not getattr(self, "signed_in", False):
+                return "Sign-in is needed before I can send anything to your phone."
+            send_fn = getattr(self.tools_impl, "send_to_phone", None)
+            if not send_fn:
+                return "Sending to the phone is not available."
+            return await send_fn(args.get("kind"), args.get("text"))
         else:
             return "failed: unknown tool"
 
