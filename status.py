@@ -106,6 +106,100 @@ def session_titles(path=None) -> dict:
     return out
 
 
+# ----------------------------------------------------------------------------- live session (R43)
+# A handover is only as new as its last save. If the session's own transcript is newer, say what it is doing now.
+PROJECTS = os.environ.get("VOICE_CLAUDE_PROJECTS", "~/.claude/projects")
+TAIL_BYTES = 200 * 1024
+_TITLE_RE = re.compile(r'"(?:customTitle|agentName)"\s*:\s*"([^"]*)"')
+
+
+def _plain(name):
+    return re.sub(r"^[^A-Za-z]+", "", str(name or "")).strip().lower()
+
+
+def _role_entry(role, roles_path=None):
+    """(folder, accepted session names) for a task key, from roles_json; (None, set()) when unknown."""
+    try:
+        roles = json.load(open(roles_path or ROLES_JSON))
+    except (OSError, ValueError):
+        return None, set()
+    for folder, d in roles.items():
+        if isinstance(d, dict) and role in (d.get("tasks") or []):
+            titles = d.get("task_titles") or {}
+            names = {_plain(titles[role])} if titles.get(role) else set()
+            if len(d.get("tasks", [])) == 1:
+                names |= {_plain(d.get("title")), _plain(d.get("session"))}
+            return folder, {n for n in names if n}
+    return None, set()
+
+
+def _read_tail(path, size, nbytes=TAIL_BYTES):
+    with open(path, "rb") as f:
+        f.seek(max(0, size - nbytes))
+        return f.read().decode("utf-8", "replace")
+
+
+def _file_title(path, size):
+    """The session's last custom title / name: from the tail, else the head."""
+    for chunk in (_read_tail(path, size), _read_tail(path, 65536, 65536) if size > TAIL_BYTES else ""):
+        found = _TITLE_RE.findall(chunk)
+        if found:
+            try:
+                return _plain(json.loads('"%s"' % found[-1]))   # undo \\u escapes
+            except ValueError:
+                return _plain(found[-1])
+    return ""
+
+
+def _last_assistant_text(chunk):
+    for ln in reversed(chunk.splitlines()):
+        if '"assistant"' not in ln or '"text"' not in ln:
+            continue
+        try:
+            d = json.loads(ln)
+        except ValueError:
+            continue   # the first line of a tail is usually cut in half
+        if d.get("type") != "assistant" or d.get("isSidechain"):
+            continue
+        c = (d.get("message") or {}).get("content")
+        texts = [b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text"] if isinstance(c, list) else []
+        text = " ".join(re.sub(r"[*#`>|]+", "", " ".join(texts)).split())   # spoken aloud: no Markdown marks
+        if text:
+            return text
+    return ""
+
+
+def live_activity(role, handover_mtime, projects=None, roles_path=None, limit=200):
+    """(transcript mtime, one-line last assistant text) when the role's live session wrote after its handover, else None.
+    Fails soft: any problem means None, so the handover alone is used."""
+    try:
+        folder, names = _role_entry(role, roles_path)
+        if not folder or not names:
+            return None
+        proj = os.path.join(os.path.expanduser(projects or PROJECTS), re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(folder)))
+        files = []
+        with os.scandir(proj) as it:
+            for e in it:
+                if e.name.endswith(".jsonl"):
+                    st = e.stat()
+                    if st.st_mtime > handover_mtime:
+                        files.append((st.st_mtime, st.st_size, e.path))
+        for mtime, size, path in sorted(files, reverse=True)[:5]:
+            if _file_title(path, size) in names:
+                text = _last_assistant_text(_read_tail(path, size))
+                return (mtime, text[:limit].rstrip()) if text else None
+    except Exception:
+        return None
+    return None
+
+
+def live_line(role, handover_mtime, now=None, **kw):
+    got = live_activity(role, handover_mtime, **kw)
+    if not got:
+        return None
+    return "live now (%s): %s" % (time.strftime("%H:%M", time.localtime(got[0])), got[1])
+
+
 def sessions_status(folder=None, now=None, max_chars=1800, recent_hours=48, width=150, titles=None) -> str:
     folder = folder or CARRYOVER
     now = now or time.time()
@@ -132,7 +226,9 @@ def sessions_status(folder=None, now=None, max_chars=1800, recent_hours=48, widt
             continue
         nxt = _section(text, "next step")[:width]
         when = time.strftime("%a %H:%M", time.localtime(mtime))
-        rows.append((mtime, "%s (saved %s): next step: %s" % (name, when, nxt or "not written")))
+        row = "%s (saved %s): next step: %s" % (name, when, nxt or "not written")
+        live = live_line(role, mtime)
+        rows.append((max(mtime, os.path.getmtime(path)), row + (" | " + live if live else "")))
     rows.sort(reverse=True)
     out = ["SESSIONS STATUS (the owner's agent sessions, read just now from their handovers; last %d hours):" % recent_hours]
     out += ["- " + ln for _, ln in rows[:12]] or ["- no session saved a handover recently"]
@@ -168,7 +264,9 @@ def overview(folder, now, titles, n=3):
         except OSError:
             continue
         if nxt:
-            rows.append((mtime, "%s, %s: %s" % (titles.get(role, role), _ago(now - mtime), _first_sentence(nxt, 120))))
+            row = "%s, %s: %s" % (titles.get(role, role), _ago(now - mtime), _first_sentence(nxt, 120))
+            live = live_line(role, mtime)
+            rows.append((mtime, row + (" (" + live + ")" if live else "")))
     rows.sort(reverse=True)
     if not rows:
         return "No session saved notes recently."
@@ -239,6 +337,9 @@ def session_status(role, folder=None, now=None, updates_fn=None, titles=None):
         nxt = _section(open(path, encoding="utf-8").read(), "next step")
         parts.append("%s saved its notes at %s, %s. Its next step, in its own words: %s" % (
             name, time.strftime("%H:%M", time.localtime(mtime)), _ago(now - mtime), _first_sentence(nxt) if nxt else "not written"))
+        live = live_line(role, mtime)
+        if live:   # R43: the live session is newer than its handover, so say what it is doing now
+            parts.append("The handover may be out of date. Newer, from the live session: " + live)
     except (OSError, ValueError, KeyError):
         parts.append("%s has no saved notes I can read" % name)
     try:
