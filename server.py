@@ -38,6 +38,9 @@ from handoff import route as handoff_route  # noqa: E402
 from stt import FakeSpeechToText, WhisperSpeechToText, available_engine  # noqa: E402
 import tts as tts_mod  # noqa: E402
 import updates  # noqa: E402
+import askmodel  # noqa: E402
+import handoff as handoff_mod  # noqa: E402
+import propfacts  # noqa: E402
 from tts import FakeTextToSpeech, default_tts, find_and_store_qwen_key, QwenTextToSpeech  # noqa: E402
 import realtime  # noqa: E402
 import transfer  # noqa: E402
@@ -73,6 +76,7 @@ class CallState:
         self.notices = []             # lines Dot must say when she is quiet (a held hand-off that failed)
         self.channel_rows = []        # R27: one row per hand-off of this call, shown on the page (max CHANNEL_ROWS_MAX)
         self.tag_base = 0             # each Live session numbers its lines from here (no clash across sessions)
+        self.ask_tasks = set()     # R30: second-opinion calls still running
         self.tokens = set()        # every reconnect token issued in this call
         self.call = None           # the Call using it now
         self.last_used = time.time()
@@ -264,8 +268,28 @@ def log_turn(path, **kw):
 class LiveTools:
     def __init__(self, call):
         self.call = call
+        self._summary_asked = ""
 
-    async def hand_off(self, words, agent, replaces_waiting=False):
+    def _say_sent(self, agent, words=""):
+        """R36: the exact line Dot says after a hand-off. Plain "Sent." when she is already in that channel (never "It went to
+        the Vault" in the Vault channel, never a role code), else "Sent to <label>."."""
+        zh = self._zh(words)
+        key = agent if agent and agent != "AUTO" else None
+        ch = getattr(self.call, "target", "AUTO")
+        if not key or key == ch or ROLE_ALIASES.get(key) == ch:
+            return "\u5df2\u53d1\u9001\u3002" if zh else "Sent."
+        name = transfer.spoken_label(key, TARGETS)
+        return ("\u5df2\u53d1\u7ed9 %s\u3002" % name) if zh else "Sent to %s." % name
+
+    def reminder_agent(self, words, agent):
+        """R35: reminders and alarms are never a property session's job: they go to the personal / organizer role."""
+        low = " ".join(str(words or "").lower().split())
+        if not any(w in low for w in config.get("reminder_words")):
+            return agent
+        role = handoff_mod.reminder_role(TARGETS)
+        return role if role and agent != role else agent
+
+    async def hand_off(self, words, agent, replaces_waiting=False, summary=None):
         """Live: held HANDOFF_HOLD_S so she can correct it (her gap G4, 2026-10-12). A hand_off marked as her
         correction replaces the waiting one (her correction is added to the words, the new session wins); any other
         hand_off sends the waiting one first; cancel_hand_off drops it. Whatever still waits is sent at once when
@@ -276,6 +300,16 @@ class LiveTools:
         moved = await self.guard_transfer(words)   # R29: a transfer phrase is never posted as a task
         if moved:
             return moved
+        if not replaces_waiting and propfacts.is_property_question(words):   # R35: a property fact is answered here, in seconds
+            facts = await propfacts.lookup(words)
+            if facts:
+                return ("answered from the Vault lookup, nothing was handed off. Say this to the caller in one or two short "
+                        "sentences: %s" % facts)
+        agent = self.reminder_agent(words, agent)
+        if transfer.has_cjk(words) and not summary and self._summary_asked != words:   # R34: carry.py cannot take Chinese
+            self._summary_asked = words
+            return ("not sent yet: call hand_off again with summary = one short English sentence saying what she asked "
+                    "(same agent), then say the line its result gives")
         sug = await self.suggestion_step(words, agent, replaces_waiting)
         if isinstance(sug, str):
             return sug
@@ -295,18 +329,20 @@ class LiveTools:
                 row.update(key=p["agent"] or "AUTO", label=dict(TARGETS).get(p["agent"] or "AUTO", p["agent"] or "AUTO"),
                            snippet=_short(p["words"], 40))
                 await channels_push(st)
-            return "updated: the waiting hand-off now goes to %s" % (p["agent"] or "the right session")
+            return "updated: the waiting hand-off now goes to %s. Say exactly this and nothing else: \"%s\"" % (
+                p["agent"] or "the right session", self._say_sent(p["agent"], words))
         if getattr(self.call, "handoff_count", 0) >= 6:
             return "limit reached, tell the caller to use the menu"
         if not agent or agent == "AUTO":   # R28: on a channel, work goes there unless the caller names another
             ch = getattr(self.call, "target", "AUTO")
             agent = ch if ch not in ("AUTO", "VOICE") else agent
-        p = {"words": words, "agent": agent}
+        p = {"words": words, "agent": agent, "summary": summary}
         p["row"] = channel_row_add(st, words, agent, "waiting")
         p["task"] = asyncio.create_task(self._post_later(p))
         st.pending_handoff = p
         await channels_push(st)
-        return "queued for %s, sent in a few seconds unless the caller corrects it" % (agent or "the right session")
+        return "queued for %s, sent in a few seconds unless the caller corrects it. Say exactly this and nothing else: \"%s\"" % (
+            agent or "the right session", self._say_sent(agent, words))
 
     def _zh(self, words=""):
         return transfer.has_cjk(words) if words else getattr(self.call, "live_lang", "") == "zh-CN"
@@ -340,7 +376,8 @@ class LiveTools:
             return "%s, target unchanged. Say exactly this and nothing else: \"%s\"" % (
                 "no previous channel" if res[0] == "prev" else "unknown channel", say)
         if key == "AUTO":
-            note = "The caller is back with you (Dot); handle her requests as before."
+            say = say if say != "Dot here." else "Dot here. Go ahead."   # R36: a two-word line was sometimes not spoken at all
+            note = "The caller is back with you (Dot): speak the line aloud, then handle her requests as before."
         else:
             name = transfer.spoken_label(key, TARGETS)
             note = ("You are now the %s line: the caller is on the %s channel; real work goes to %s (hand_off with no agent "
@@ -402,9 +439,14 @@ class LiveTools:
                 "channel %s. If she says no or anything else, call hand_off again (her request is kept)." % (q, key))
 
     async def cancel_hand_off(self):
-        p, self.call.state.pending_handoff = self.call.state.pending_handoff, None
+        st = self.call.state
+        p, st.pending_handoff = st.pending_handoff, None
         if p is None:
-            return "nothing to cancel: the last hand-off was already sent"
+            last = st.channel_rows[-1] if st.channel_rows else None
+            if last is not None and last["status"] in ("sent", "replied"):
+                return ("nothing to cancel: the last hand-off was already sent to %s. Say exactly this and nothing else: "
+                        "\"It was already sent.\"" % last["label"])
+            return "nothing to cancel: nothing was sent. Say exactly this and nothing else: \"Nothing was sent.\""
         p["task"].cancel()
         if p.get("row"):
             p["row"]["status"] = "cancelled"
@@ -423,7 +465,7 @@ class LiveTools:
         if p is None or st.pending_handoff is not p:
             return
         st.pending_handoff = None
-        out = await self._post(p["words"], p["agent"], p.get("row"))
+        out = await self._post(p["words"], p["agent"], p.get("row"), p.get("summary"))
         if p.get("row") and not out.startswith("posted"):
             p["row"]["status"] = "failed"
             await channels_push(st)
@@ -431,10 +473,12 @@ class LiveTools:
             log_line("live: held hand-off failed", self.call.svc.turn_log)
             st.notices.append("Sorry, that hand-off did not go through. Please say it again.")   # said when she is quiet
 
-    async def _post(self, words, agent, row=None):
+    async def _post(self, words, agent, row=None, summary=None):
         try:
             ctx = self.call.warm_context(words)
             extra = {"context": ctx} if ctx else {}
+            if summary:
+                extra["summary"] = summary
             rec = await asyncio.to_thread(self.call.svc.handoff.create, words, words, role=agent, **extra)
         except Exception as e:
             return "not sent: %s" % (str(e) or type(e).__name__)[:120]
@@ -454,9 +498,54 @@ class LiveTools:
         reason = (rec.get("post_error") if rec else "") or "failed to post"
         return "not sent: %s" % reason
 
+    FOLLOW_UP = re.compile(r"\b(it|that|this|found|find|get|got|done|finished|reply|replied|answer|result|heard|back|yet|update)\b|"
+                           "\u627e\u5230|\u56de\u590d|\u5b8c\u4e86|\u7ed3\u679c", re.I)
+
+    def handoff_record(self, question, session=None):
+        """R37: "did you find it?" is about a hand-off of THIS call. Answers from the call's Channels rows (waiting, sent and
+        how long ago, replied with the reply, cancelled, failed). None when this call made no hand-off to ask about: then the
+        session's own saved note answers as before."""
+        rows = self.call.state.channel_rows
+        if not rows:
+            return None
+        row = None
+        if session and session != "AUTO":
+            keys = {session, ROLE_ALIASES.get(session, session)}
+            mine = [r for r in rows if r["key"] in keys]
+            row = mine[-1] if mine else None
+        elif self.FOLLOW_UP.search(str(question or "")):
+            row = rows[-1]
+        if row is None:
+            return None
+        who = transfer.spoken_label(row["key"], TARGETS)
+        zh = transfer.has_cjk(row["snippet"])
+        st = row["status"]
+        if st == "replied":
+            return "%s replied: %s" % (who, row["reply"] or "it answered")
+        if st == "sent":
+            mins = int(max(0, time.time() - (row.get("sent_at") or time.time())) // 60)
+            ago = "just now" if mins < 1 else "%d minute%s ago" % (mins, "" if mins == 1 else "s")
+            return "Sent to %s %s, no reply yet." % (who, ago)
+        if st == "waiting":
+            return "Your request to %s is about to be sent." % who
+        if st == "cancelled":
+            return "That request was cancelled, nothing was sent."
+        return "That request to %s did not go through." % who
+
+    @staticmethod
+    def brief(text, sentences=2, limit=240):
+        """R37: a status answer is spoken in at most two short sentences, never read out in full."""
+        t = " ".join(str(text or "").split())
+        parts = re.split(r"(?<=[.!?\u3002])\s+", t)
+        out = " ".join(parts[:sentences])
+        return out if len(out) <= limit else out[:limit].rsplit(" ", 1)[0].rstrip(",;:") + "."
+
     async def status(self, question, session=None):
         """The model decides what is asked (no phrase rules): a named session gets its own status, else all sessions."""
         import status as status_mod
+        rec = self.handoff_record(question, session)
+        if rec:
+            return rec
         res = None
         try:
             role = session if session in TARGET_KEYS and session != "AUTO" else None
@@ -470,17 +559,48 @@ class LiveTools:
         except Exception:
             res = None
         if res:
-            return str(res).strip()
+            return self.brief(res)
         return "No saved status for that."
 
     async def lookup(self, words):
+        if propfacts.is_property_question(words):   # R35: property facts first, from the Vault lookup, in seconds
+            facts = await propfacts.lookup(words)
+            if facts:
+                return facts
+            miss = (" No Vault record was found by the quick lookup: say so in one short sentence and call hand_off so the "
+                    "Vault session looks into it.")
+        else:
+            miss = ""
         try:
             import frontdesk
             notes = await asyncio.to_thread(frontdesk.gather_notes, words, frontdesk.brain_notes)
         except Exception:
             return "Nothing found."
         notes = (notes or "").strip()
-        return notes if notes else "Nothing found."
+        return (notes if notes else "Nothing found.") + miss
+
+    async def ask_model(self, model, question):
+        """R30: a second opinion from Opus / Sonnet / Haiku. Returns at once; the answer joins state.notices, which the
+        updates loop speaks when Dot is quiet (same path as a failed hand-off notice). Question text is never logged."""
+        key, err = askmodel.pick_model(model)
+        if err:
+            return err
+        if not (question or "").strip():
+            return "No question heard, ask the caller to say it again."
+        st = self.call.state
+        task = asyncio.create_task(self._ask_model_bg(key, question))
+        st.ask_tasks.add(task)
+        task.add_done_callback(st.ask_tasks.discard)
+        return "Asking %s now, the answer will be spoken in a few seconds." % key.capitalize()
+
+    async def _ask_model_bg(self, key, question):
+        st = self.call.state
+        status, text, ms = await askmodel.ask(key, question, list(st.history))
+        log_line("ask_model: %s ms=%d %s" % (key, ms, status), self.call.svc.turn_log)
+        if status == "ok":
+            st.notices.append("%s says: %s" % (key.capitalize(), text))
+        else:
+            st.notices.append("Sorry, %s did not answer%s." % (key.capitalize(), " in time" if status == "timeout" else ""))
 
 
 class Call:
@@ -856,7 +976,8 @@ class Call:
         if not st.via_transfer or self.target in ("AUTO", "VOICE"):
             return None
         mine = " ".join(str(words or "").split())
-        lines = [l for l in self.history if " ".join(l["text"].split()) != mine and not transfer.is_suggestion_chatter(l)][-3:]
+        lines = [l for l in self.history if l["role"] == "user" and " ".join(l["text"].split()) != mine
+                 and not transfer.is_suggestion_chatter(l)][-3:]   # R36: her lines only, never Dot's own filler replies
         if not lines:
             return None
         frm = "front desk" if st.came_from in ("AUTO", "VOICE") else transfer.spoken_label(st.came_from, TARGETS)
@@ -869,7 +990,7 @@ class Call:
                 t = re.sub(r"\+?\d[\d\-\s().]{6,}\d", "[number]", t)
                 t = " ".join(t.encode("ascii", "ignore").decode().split())
                 if t:
-                    parts.append(("Caller: " if l["role"] == "user" else "Dot: ") + _short(t, 40))
+                    parts.append("Caller: " + _short(t, 40))
             body = _short(" / ".join(parts), 120)
         return ("Context (Dot, from %s): %s" % (frm, body)) if body else None
 

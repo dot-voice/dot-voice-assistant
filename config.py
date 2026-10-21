@@ -41,6 +41,13 @@ DEFAULTS = {
     "board_file": "~/.dot/board.html",
     "brain_tool": "~/.dot/brain/brain.py",
     "launchagent_label": "com.dot.voicecall",
+    "property_lookup_cmd": [],       # R35: command whose last argument is an address or MLS number; stdout = instant property answer
+    "property_lookup_timeout_s": 8,
+    "reminder_words": ["remind me", "reminder", "set an alarm", "wake me"],
+    "twilio_path_secret": "",        # phone bridge: long random URL token (>= 24 chars); empty = bridge refuses to start
+    "twilio_allowed_callers": [],    # phone bridge: E.164 numbers allowed to call; empty = reject everyone
+    "twilio_public_host": "",        # phone bridge: public host name of the Funnel, e.g. host.tailnet.ts.net
+    "twilio_port": 8772,             # phone bridge: local port (127.0.0.1 only)
 }
 
 

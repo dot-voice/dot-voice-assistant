@@ -92,7 +92,7 @@ class LiveBridgeTest(unittest.IsolatedAsyncioTestCase):
         upd = self.ws.sent[0]
         self.assertEqual(upd["type"], "session.update")
         names = [t["name"] for t in upd["session"]["tools"]]
-        self.assertEqual(names, ["hand_off", "get_status", "cancel_hand_off", "transfer_call", "lookup"])
+        self.assertEqual(names, ["hand_off", "get_status", "cancel_hand_off", "transfer_call", "lookup", "ask_model"])
         self.assertTrue(upd["session"]["voice"])
         self.assertIn("model=", self.url)
         await self.b.close()
@@ -205,6 +205,22 @@ class LiveBridgeTest(unittest.IsolatedAsyncioTestCase):
         out = [e for e in self.ws.sent if e.get("item", {}).get("type") == "function_call_output"]
         self.assertEqual(out[0]["item"]["output"], "lookup result: weather London what is the weather in London")
         self.assertEqual(out[0]["item"]["call_id"], "c_look")
+        await self.b.close()
+
+    async def test_live_calls_ask_model_with_the_model_and_question(self):
+        await self.make()
+        got = []
+
+        async def ask_model(model, question):
+            got.append((model, question))
+            return "Asking Sonnet now"
+        self.tools.ask_model = ask_model
+        self.ws.push({"type": "response.function_call_arguments.done", "name": "ask_model", "call_id": "c_ask",
+                      "arguments": json.dumps({"model": "Sonnet", "question": "Is the price fair?"})})
+        await self.settle()
+        self.assertEqual(got, [("Sonnet", "Is the price fair?")])
+        out = [e for e in self.ws.sent if e.get("item", {}).get("type") == "function_call_output"]
+        self.assertEqual(out[0]["item"]["output"], "Asking Sonnet now")
         await self.b.close()
 
     async def test_max_handoffs_per_call(self):

@@ -31,8 +31,18 @@ def _agents():
     return [n for n in names if n != "AUTO"]
 
 
+def _role_lines():
+    """R35: one line per role, 'KEY = label', from the labels in handoff_targets, so the model can match a request to a role."""
+    try:
+        return "; ".join("%s = %s" % (t[0], t[1]) for t in (_cfg("handoff_targets") or []) if t[0] != "AUTO")
+    except Exception:
+        return ""
+
+
 def build_tools():
-    agent = {"type": "string", "description": "Which session gets the work."}
+    lines = _role_lines()
+    agent = {"type": "string", "description": "Which session gets the work. Match the request to the role's label: " + lines
+             if lines else "Which session gets the work."}
     names = _agents()
     if names:
         agent["enum"] = names
@@ -42,7 +52,9 @@ def build_tools():
                         "is sent: if the caller corrects it (another session, more detail), call hand_off again and "
                         "it replaces the waiting one.",
          "parameters": {"type": "object", "properties": {"agent": agent, "replaces_waiting": {
-             "type": "boolean", "description": "True only when the caller corrects the hand-off you just made."}},
+             "type": "boolean", "description": "True only when the caller corrects the hand-off you just made."},
+             "summary": {"type": "string", "description": "One short sentence in English saying what she asked. Always give it "
+                         "when she spoke Chinese (the exact words cannot be posted); otherwise leave it out."}},
              "required": []}},
         {"type": "function", "name": "get_status",
          "description": "Status, tasks, progress or updates of the agent sessions. Pass session when one is named; "
@@ -60,6 +72,14 @@ def build_tools():
         {"type": "function", "name": "lookup",
          "description": "Look up weather, time, notes, rules, people, properties, or past decisions.",
          "parameters": {"type": "object", "properties": {"question": {"type": "string", "description": "What to look up."}}, "required": ["question"]}},
+        {"type": "function", "name": "ask_model",
+         "description": "A second opinion from a stronger Claude model. Call it when the caller says ask Opus, ask "
+                        "Sonnet, ask Haiku, what does Opus think, Sonnet's opinion, or asks for a second opinion. "
+                        "It returns at once and the answer is spoken a few seconds later.",
+         "parameters": {"type": "object", "properties": {
+             "model": {"type": "string", "description": "Opus, Sonnet or Haiku, as the caller named it; Opus if none."},
+             "question": {"type": "string", "description": "The question to put to that model, complete in itself."}},
+             "required": ["question"]}},
     ]
 
 
@@ -74,11 +94,13 @@ def build_instructions(owner, channel=None):
     return (
         f"You are the assistant of {owner} on a hands-free call. Reply in the language spoken, "
         "in one or two short sentences. For any real work call hand_off. Never claim work is done "
-        "unless a tool output says so. If the caller interrupts you, she did not hear the rest of your reply. After hand_off say only who it went to. For status questions "
-        "call get_status and read its output word for word. For weather, time, the caller's rules, people, "
-        "properties or past decisions call lookup and answer only from its output (but finding a property's owner or other client records is real work: hand_off, not lookup); never say you have "
+        "unless a tool output says so. If the caller interrupts you, she did not hear the rest of your reply. After hand_off say exactly the line its result gives, nothing more. For status questions "
+        "call get_status and say its output in at most two short sentences, in your own words without losing a fact; if it has no answer say you have no data for that, never guess. For weather, time, the caller's rules, people, "
+        "properties or past decisions call lookup and answer only from its output (a property's owner, MLS number, listing agent or address facts: call lookup FIRST and say its answer; only when it found nothing call hand_off, to the session whose label is about property records); reminders and personal tasks go to the personal or life session, never a property session; never say you have "
         "no real-time access. What the caller already said in this call counts: answer that from the conversation, "
-        "without lookup. Never invent facts. If the caller asks to be transferred, put through or switched to a channel or "
+        "without lookup. When the caller says ask Opus, ask Sonnet, what does Opus think, Sonnet's opinion or "
+        "a second opinion, call ask_model (never answer it yourself), then say only that you are asking; "
+        "the answer is spoken when it arrives. Never invent facts. If the caller asks to be transferred, put through or switched to a channel or "
         "session, back to Dot, or to the previous channel, call transfer_call (never hand_off) and say exactly the line its result gives. "
         "If hand_off returns \"not sent yet\" with a question, ask exactly that question and nothing else: on yes call transfer_call, "
         "on no or anything else call hand_off again. Never offer a transfer on your own, never for status questions, never when the caller "
@@ -127,6 +149,22 @@ def bridge_class():
     return bridge_classes()[0]
 
 
+class TurnSnap:
+    """R32: her words of the turn that ended in a tool call, frozen when the call arrives. Dot's own next turn
+    (turn_complete after the tool call) wipes the live turn state while the tool may still wait on Whisper; the tool reads
+    this record instead. Only the record is frozen: what she says after that is a new turn and never merges into it."""
+
+    def __init__(self, turn_no, pcm, transcript, words, whisper):
+        self.turn_no = turn_no
+        self.pcm = pcm
+        self.transcript = transcript
+        self.words = words
+        self.whisper = whisper
+        self.done = asyncio.Event()
+        if transcript:
+            self.done.set()
+
+
 class LiveBridge:
     def __init__(self, send_to_phone, tools_impl, instructions, model=None, connect=websockets.connect,
                  transcribe=None, on_closed=None, turn_log=None):
@@ -158,6 +196,10 @@ class LiveBridge:
         self._turn_transcript = None
         self._turn_words = None
         self._whisper_words = None
+        self._snap = None           # R32: TurnSnap of the turn whose tool call is running
+        self._last_snap = None      # R32: (TurnSnap, speech counter, monotonic) of the previous tool call
+        self._speech_n = 0          # counts moments of her speech: a tool call with none since the last one is the same request
+        self._last_handoff = None   # R33: (monotonic, turn_no, result) of the last hand-off this bridge returned
 
         # State tracking
         self._user_speaking = False
@@ -346,6 +388,7 @@ class LiveBridge:
             self.last_heard = self._turn_transcript
             self._turn_words = self._turn_transcript
             self._transcript_done.set()
+            self._feed_snap(self._turn_transcript, replace=True)
             await self.send_to_phone({"type": "live_heard", "text": self.last_heard, "turn": self._turn_no})
         elif t == "response.audio_transcript.done":
             resp_id = ev.get("response_id") or (ev.get("response") or {}).get("id")
@@ -356,6 +399,7 @@ class LiveBridge:
             self.response_active = False
             self._user_speaking = False
         elif t == "response.function_call_arguments.done":
+            self._snap = self._snapshot_turn()
             self.tool_task = asyncio.create_task(self._run_tool(ev))
         elif t == "error":
             err_data = ev.get("error") if isinstance(ev.get("error"), dict) else {}
@@ -370,32 +414,60 @@ class LiveBridge:
             else:
                 await self._fail(err_msg)
 
+    def _snapshot_turn(self):
+        pcm = self.turn_pcm or (bytes(self._turn_buf) if self._turn_buf else b"")
+        return TurnSnap(self._turn_no, pcm, self._turn_transcript, self._turn_words, self._whisper_words)
+
+    def _frozen_for_call(self):
+        """The TurnSnap for a tool call. A second tool call of the same request (a lookup, then the hand-off: Gemini sends them as
+        separate calls, and Dot's turn in between wiped the live state) reuses the first one's words when she has not spoken since."""
+        snap = self._snapshot_turn()
+        last = self._last_snap
+        if (not snap.transcript and not snap.whisper and last is not None and last[1] == self._speech_n
+                and time.monotonic() - last[2] < 60.0):
+            snap = last[0]
+        self._last_snap = (snap, self._speech_n, time.monotonic())
+        return snap
+
+    def _feed_snap(self, text, replace=False):
+        """Words that reach the bridge after the tool call started (Gemini's transcript is often late) join the snapshot."""
+        s = self._snap
+        if s is None or not text:
+            return
+        s.transcript = text.strip() if replace else ((s.transcript or "") + " " + text).strip()
+        s.done.set()
+
     async def _get_turn_words(self):
         """Her exact words for a hand-off. Local Whisper of the turn audio first: Qwen's separate ASR sometimes
         returns the wrong language. Qwen's
-        transcript is the fallback when Whisper is missing or hears nothing."""
-        if self._whisper_words is not None:
-            return self._whisper_words
-        pcm = self.turn_pcm or (bytes(self._turn_buf) if self._turn_buf else b"")
+        transcript is the fallback when Whisper is missing or hears nothing. Works on the frozen TurnSnap of the turn
+        that called the tool (R32), so Dot's next turn starting cannot wipe it."""
+        snap = self._snap or self._snapshot_turn()
+        if snap.whisper is not None:
+            return snap.whisper
         if self.transcribe is not None:
             try:
-                words = str(await asyncio.to_thread(self.transcribe, pcm) or "").strip()
+                words = str(await asyncio.to_thread(self.transcribe, snap.pcm) or "").strip()
             except Exception:
                 words = ""
             if words:
-                self._whisper_words = self.last_heard = self._turn_words = words
-                await self.send_to_phone({"type": "live_heard", "text": words, "turn": self._turn_no})
+                snap.whisper = snap.words = words
+                if snap.turn_no == self._turn_no:   # still her current turn: the live state agrees
+                    self._whisper_words = self.last_heard = self._turn_words = words
+                await self.send_to_phone({"type": "live_heard", "text": words, "turn": snap.turn_no})
                 return words
-        if not self._transcript_done.is_set():
+        if not snap.done.is_set() and not self._transcript_done.is_set():
             try:
-                await asyncio.wait_for(self._transcript_done.wait(),
+                await asyncio.wait_for(snap.done.wait(),
                                        timeout=2.5 if self.transcribe is None else self.transcript_wait_s)
             except (asyncio.TimeoutError, Exception):
                 self._log_line("live: no words (Whisper empty, Qwen transcript late)")
-        words = self._turn_transcript
-        if words:
+        words = snap.transcript or (self._turn_transcript if snap.turn_no == self._turn_no else "") or ""
+        if not words and snap.words:
+            words = snap.words
+        if words and snap.turn_no == self._turn_no:
             self.last_heard = self._turn_words = words
-        return self._turn_words or ""
+        return words or ""
 
     def _log_line(self, text):
         path = self.turn_log or getattr(getattr(getattr(self.tools_impl, "call", None), "svc", None), "turn_log", None)
@@ -419,47 +491,88 @@ class LiveBridge:
                 pass
 
     async def _exec_tool(self, name, args):
+        owns = self._snap is None
+        if owns:
+            self._snap = self._snapshot_turn()
+        try:
+            return await self._exec_tool_inner(name, args)
+        finally:
+            if owns:
+                self._snap = None
+
+    DUP_HANDOFF_S = 10.0
+
+    def _duplicate_handoff(self, args):
+        """R33: Gemini sometimes calls hand_off twice for one request (one turn, or a second call right after the first's
+        result with no new speech from her). The second one returns the first's result and sends nothing."""
+        last = self._last_handoff
+        if not last or args.get("replaces_waiting"):
+            return None
+        t, turn_no, out = last
+        if time.monotonic() - t > self.DUP_HANDOFF_S:
+            return None
+        snap = self._snap
+        same_turn = snap is not None and snap.turn_no == turn_no
+        no_new_speech = (snap is None or not snap.transcript) and not str(getattr(self, "_heard", "") or "").strip()
+        return out if (same_turn or no_new_speech) else None
+
+    async def _exec_tool_inner(self, name, args):
+        snap = self._snap
         if name == "hand_off":
             if self.handoff_count >= 6:
                 return "limit reached, tell the caller to use the menu"
+            dup = self._duplicate_handoff(args)
+            if dup:
+                return "already handled, do not repeat it. " + dup
             words = await self._get_turn_words()
             if not words or len(words) < 2:
                 return "not sent: I did not catch the words, ask the caller to say it again"
-            if args.get("replaces_waiting"):
-                out = await self.tools_impl.hand_off(words, args.get("agent"), replaces_waiting=True)
-            else:
-                out = await self.tools_impl.hand_off(words, args.get("agent"))
+            kw = {"replaces_waiting": True} if args.get("replaces_waiting") else {}
+            if str(args.get("summary") or "").strip():
+                kw["summary"] = str(args["summary"]).strip()[:300]
+            out = await self.tools_impl.hand_off(words, args.get("agent"), **kw)
             if str(out).startswith(("posted", "queued")):   # a correction ("updated") is not a new hand-off
                 self.handoff_count += 1
+            if str(out).startswith(("posted", "queued", "updated")):
+                self._last_handoff = (time.monotonic(), snap.turn_no, str(out))
             return out
         elif name == "transfer_call":
             fn = getattr(self.tools_impl, "transfer", None)
             if not fn:
                 return "failed: transfers are not available"
-            return await fn(str(args.get("channel") or ""), (self._turn_transcript or "").strip())
+            return await fn(str(args.get("channel") or ""), (snap.transcript or "").strip())
         elif name == "cancel_hand_off":
             cancel = getattr(self.tools_impl, "cancel_hand_off", None)
             return await cancel() if cancel else "nothing to cancel"
         elif name == "get_status":   # the model picks the session; her words only help pick it
-            if not self._turn_transcript and not self._transcript_done.is_set():
+            if not snap.transcript and not snap.done.is_set():
                 try:   # her words of THIS turn may still be on their way (never the last turn's words)
-                    await asyncio.wait_for(self._transcript_done.wait(), timeout=1.5)
+                    await asyncio.wait_for(snap.done.wait(), timeout=1.5)
                 except (asyncio.TimeoutError, Exception):
                     pass
-            q = self._turn_transcript or ""
+            q = snap.transcript or ""
             return await self.tools_impl.status(q, session=args.get("session"))
         elif name == "lookup":   # the model's question (it understood the audio) plus the heard words (exact names)
-            q = " ".join(x for x in ((args.get("question") or "").strip(), (self._turn_transcript or "").strip()) if x)
+            q = " ".join(x for x in ((args.get("question") or "").strip(), (snap.transcript or "").strip()) if x)
             if len(q) < 2:
                 q = await self._get_turn_words()
             lookup_fn = getattr(self.tools_impl, "lookup", None)
             if lookup_fn:
                 return await lookup_fn(q)
             return "Nothing found."
+        elif name == "ask_model":   # R30: returns at once; the answer is spoken later (server.LiveTools.ask_model)
+            q = (args.get("question") or "").strip()
+            if len(q) < 2:
+                q = await self._get_turn_words()
+            ask_fn = getattr(self.tools_impl, "ask_model", None)
+            if not ask_fn:
+                return "Asking another model is not available."
+            return await ask_fn(args.get("model"), q)
         else:
             return "failed: unknown tool"
 
     async def _run_tool(self, ev):
+        snap = self._snap
         try:
             name, call_id = ev.get("name"), ev.get("call_id")
             try:
@@ -489,3 +602,6 @@ class LiveBridge:
         except Exception as e:
             if not self._closing and not self.closed:
                 await self._fail(str(e) or type(e).__name__)
+        finally:
+            if snap is not None and self._snap is snap:
+                self._snap = None

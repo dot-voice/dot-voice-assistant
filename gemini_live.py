@@ -14,7 +14,7 @@ import tts
 
 KEYCHAIN = "voice-call-gemini"
 DEFAULT_MODEL = "gemini-3.8-live"
-DEFAULT_VOICE = "Iapetus"
+DEFAULT_VOICE = "Algenib"
 TURN_CAP = 960000   # 30 s of 16 kHz pcm16
 PIECE = 9600        # 0.2 s of 24 kHz pcm16 per phone message
 AHEAD_S = 1.0       # keep at most this much audio queued on the phone
@@ -377,6 +377,7 @@ class GeminiBridge(realtime.LiveBridge):
             self._voice_bytes += len(pcm)
         if self._her_voice() and self._in_turn and not playing:
             self._user_speaking = True
+            self._speech_n += 1
             self._activity_at = time.monotonic()
             self.stopped_at = None
 
@@ -394,6 +395,7 @@ class GeminiBridge(realtime.LiveBridge):
         """The phone heard her voice over Dot's reply (it already stopped its own playback)."""
         if self._in_turn and not self._activity_at:
             self._user_speaking = True
+            self._speech_n += 1
             self._activity_at = time.monotonic()
         await self._barge_in("phone")
 
@@ -528,6 +530,7 @@ class GeminiBridge(realtime.LiveBridge):
         tc = getattr(msg, "tool_call", None)
         if tc is not None and tc.function_calls:
             await self._end_turn()
+            self._snap = self._frozen_for_call()   # R32: her words stay frozen for the tool, whatever the next turn does
             self.tool_task = asyncio.create_task(self._run_calls(list(tc.function_calls)))
         cancel = getattr(msg, "tool_call_cancellation", None)
         if cancel is not None and self.tool_task and not self.tool_task.done():
@@ -600,6 +603,7 @@ class GeminiBridge(realtime.LiveBridge):
         self._va_start_at = now
         if self._in_turn:
             self._user_speaking = True
+            self._speech_n += 1
             self._activity_at = now
             self.stopped_at = None
         if self._dot_sounding() or not self._in_turn:
@@ -617,8 +621,10 @@ class GeminiBridge(realtime.LiveBridge):
                     and time.monotonic() - self._turn_started < LATE_S)
             if late:   # the last turn's words arriving after its turn_complete: not part of this turn
                 self.last_heard = ((self.last_heard or "") + " " + it.text).strip()
+                self._feed_snap(it.text)   # ... but a tool still running for that turn needs them (R32)
             elif self._in_turn:
                 self._user_speaking = True
+                self._speech_n += 1
                 self._activity_at = time.monotonic()
                 self.stopped_at = None
                 self._heard += it.text
@@ -632,6 +638,7 @@ class GeminiBridge(realtime.LiveBridge):
                 if not self._whisper_words:
                     self._turn_words = self._turn_transcript
                 self._transcript_done.set()
+                self._feed_snap(self._turn_transcript, replace=True)
         if sc.interrupted:
             self._log_line("live: gemini interrupted playing=%.1fs" % max(0.0, self._play_until - time.monotonic()))
             if self._cut_played is None:   # memory keeps only what she heard of this reply
@@ -641,6 +648,7 @@ class GeminiBridge(realtime.LiveBridge):
             await self._send_heard()
             self._start_turn()
             self._user_speaking = True
+            self._speech_n += 1
             self._activity_at = time.monotonic()
             await self.send_to_phone({"type": "live_stop"})
             return
@@ -686,6 +694,7 @@ class GeminiBridge(realtime.LiveBridge):
 
     async def _run_calls(self, calls):
         types = _types()
+        snap = self._snap
         try:
             responses = []
             for fc in calls:
@@ -708,3 +717,6 @@ class GeminiBridge(realtime.LiveBridge):
         except Exception as e:
             if not self._closing and not self.closed:
                 await self._fail(str(e) or type(e).__name__)
+        finally:
+            if snap is not None and self._snap is snap:
+                self._snap = None

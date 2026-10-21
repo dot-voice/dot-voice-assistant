@@ -1,0 +1,349 @@
+"""Phone bridge: call Dot from a real phone number (Twilio Media Streams). An adapter only: it speaks to the running Dot
+service exactly like the call page does (ws://127.0.0.1:8770/ws, Live mode) and converts the audio both ways.
+
+Run:  python3 twilio_bridge.py --run      (127.0.0.1:8772; expose only /tw/<secret> with `tailscale funnel`, see docs/PHONE.md)
+
+Security layers: secret path token, caller-ID allowlist, keypad PIN (3 tries), one-time per-call stream token (60 s),
+and the Twilio request signature when an auth token is stored in the Keychain (KEYCHAIN_ITEM below).
+
+Twilio is set to HTTP GET for the voice and PIN webhooks: the websockets server cannot read a POST body, and GET keeps this
+to one small port and one library. Audio: Twilio is 8 kHz mu-law 20 ms frames; Dot takes 16 kHz mono 16-bit PCM
+(960-sample chunks) and answers with 24 kHz mono 16-bit PCM in "live_audio" messages; "live_stop" means stop playing.
+"""
+import asyncio
+import base64
+import binascii
+import hmac
+import json
+import os
+import secrets
+import subprocess
+import sys
+import time
+from hashlib import sha1
+from http import HTTPStatus
+from urllib.parse import parse_qsl, urlsplit
+from xml.sax.saxutils import escape, quoteattr
+
+import numpy as np
+
+import config
+from auth import PinGuard
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PIN_FILE = os.path.join(HERE, "pin.txt")
+DOT_URL = "ws://127.0.0.1:8770/ws"
+MAX_PIN_TRIES = 3
+TOKEN_TTL_S = 60
+MIN_SECRET_LEN = 24
+DOT_CHUNK = 960          # samples of 16 kHz PCM per message to Dot (the page sends the same)
+TW_FRAME = 160           # 20 ms of 8 kHz mu-law
+KEYCHAIN_ITEM = "voice-call-twilio-auth"
+
+
+# ------------------------------------------------------------------ audio
+def _build_mulaw_tables():
+    u = (~np.arange(256, dtype=np.int32)) & 0xFF
+    mag = ((((u & 0x0F) << 3) + 0x84) << ((u >> 4) & 7)) - 0x84
+    dec = np.where(u & 0x80, -mag, mag).astype(np.int16)
+    s = np.arange(-32768, 32768, dtype=np.int32)
+    sign = np.where(s < 0, 0x80, 0)
+    m = np.minimum(np.abs(s), 32635) + 0x84
+    exp = np.floor(np.log2(m)).astype(np.int32) - 7
+    enc = ((~(sign | (exp << 4) | ((m >> (exp + 3)) & 0x0F))) & 0xFF).astype(np.uint8)
+    return dec, enc
+
+
+_MU_DEC, _MU_ENC = _build_mulaw_tables()
+
+
+def mulaw_decode(data: bytes) -> np.ndarray:
+    return _MU_DEC[np.frombuffer(data, dtype=np.uint8)]
+
+
+def mulaw_encode(pcm: np.ndarray) -> bytes:
+    return _MU_ENC[pcm.astype(np.int32) + 32768].tobytes()
+
+
+class Upsampler8to16:
+    """8 kHz -> 16 kHz by linear interpolation; remembers the last sample so frame edges stay smooth."""
+
+    def __init__(self):
+        self.prev = 0
+
+    def feed(self, pcm8: np.ndarray) -> np.ndarray:
+        if not len(pcm8):
+            return np.zeros(0, dtype=np.int16)
+        cur = pcm8.astype(np.int32)
+        before = np.concatenate(([self.prev], cur[:-1]))
+        out = np.empty(len(cur) * 2, dtype=np.int32)
+        out[0::2] = (before + cur) // 2
+        out[1::2] = cur
+        self.prev = int(cur[-1])
+        return out.astype(np.int16)
+
+
+class Downsampler24to8:
+    """24 kHz 16-bit PCM bytes -> 8 kHz int16: average each group of 3 samples (a low-pass, no aliasing)."""
+
+    def __init__(self):
+        self.rest = b""
+
+    def feed(self, data: bytes) -> np.ndarray:
+        data = self.rest + data
+        n = len(data) // 6 * 6
+        self.rest = data[n:]
+        if not n:
+            return np.zeros(0, dtype=np.int16)
+        x = np.frombuffer(data[:n], dtype="<i2").astype(np.int32).reshape(-1, 3)
+        return (x.sum(axis=1) // 3).astype(np.int16)
+
+
+# ------------------------------------------------------------------ security helpers
+def twilio_signature(auth_token: str, url: str, params=()) -> str:
+    """Twilio's X-Twilio-Signature: base64(HMAC-SHA1(token, url + sorted key/value pairs))."""
+    data = url + "".join(k + v for k, v in sorted(params))
+    return base64.b64encode(hmac.new(auth_token.encode(), data.encode(), sha1).digest()).decode()
+
+
+def keychain_auth_token():
+    """The Twilio auth token from the Keychain, or "" when the item does not exist (signature check then skipped)."""
+    try:
+        r = subprocess.run(["security", "find-generic-password", "-s", KEYCHAIN_ITEM, "-w"], capture_output=True,
+                           text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+class StreamTokens:
+    """One-time stream tokens minted after the PIN: single use, TTL seconds."""
+
+    def __init__(self, ttl=TOKEN_TTL_S, clock=time.monotonic):
+        self.ttl, self.clock, self._t = ttl, clock, {}
+
+    def mint(self, call_sid: str) -> str:
+        now = self.clock()
+        self._t = {k: v for k, v in self._t.items() if v[1] > now}
+        tok = secrets.token_urlsafe(24)
+        self._t[tok] = (call_sid, now + self.ttl)
+        return tok
+
+    def consume(self, token) -> bool:
+        item = self._t.pop(token, None) if isinstance(token, str) else None
+        return bool(item) and item[1] > self.clock()
+
+
+def twiml(*inner) -> str:
+    return '<?xml version="1.0" encoding="UTF-8"?><Response>' + "".join(inner) + "</Response>"
+
+
+def log(msg):
+    sys.stderr.write("%s twilio_bridge: %s\n" % (time.strftime("%H:%M:%S"), msg))
+    sys.stderr.flush()
+
+
+# ------------------------------------------------------------------ the bridge
+class Bridge:
+    def __init__(self, pin, secret, allowed_callers, public_host, dot_url=DOT_URL, auth_token_fn=keychain_auth_token,
+                 allowed_login="", guard=None, tokens=None):
+        if len(secret or "") < MIN_SECRET_LEN:
+            raise ValueError("twilio_path_secret must be at least %d characters" % MIN_SECRET_LEN)
+        self.pin, self.secret = pin, secret
+        self.allowed = {str(c) for c in allowed_callers}
+        self.public_host, self.dot_url = public_host, dot_url
+        self.auth_token_fn, self.allowed_login = auth_token_fn, allowed_login
+        self.guard = guard or PinGuard(pin)
+        self.tokens = tokens or StreamTokens()
+        self.tries = {}   # CallSid -> wrong PINs so far
+        self.base = "/tw/" + secret
+
+    # --- HTTP (TwiML) ---
+    def _xml(self, connection, body, status=HTTPStatus.OK):
+        resp = connection.respond(status, body)
+        del resp.headers["Content-Type"]
+        resp.headers["Content-Type"] = "text/xml; charset=utf-8"
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    def _signature_ok(self, request) -> bool:
+        token = self.auth_token_fn()
+        if not token:
+            return True   # optional layer: no auth token stored, skip
+        url = "https://" + self.public_host + request.path
+        sig = request.headers.get("X-Twilio-Signature", "")
+        return hmac.compare_digest(twilio_signature(token, url).encode(), sig.encode())
+
+    def process_request(self, connection, request):
+        parts = urlsplit(request.path)
+        path = parts.path
+        is_ws = request.headers.get("Upgrade", "").lower() == "websocket"
+        if is_ws and hmac.compare_digest(path.encode(), (self.base + "/media").encode()):
+            return None
+        if is_ws or not path.startswith("/tw/"):
+            return connection.respond(HTTPStatus.NOT_FOUND, "not found\n")
+        route = None
+        for name in ("voice", "pin"):
+            if hmac.compare_digest(path.encode(), ("%s/%s" % (self.base, name)).encode()):
+                route = name
+        if route is None:
+            return connection.respond(HTTPStatus.NOT_FOUND, "not found\n")
+        q = dict(parse_qsl(parts.query))
+        if not self._signature_ok(request):
+            log("refused: bad Twilio signature")
+            return connection.respond(HTTPStatus.FORBIDDEN, "forbidden\n")
+        if q.get("From", "") not in self.allowed:   # an empty allowlist rejects everyone
+            log("refused: caller not on the allowlist")
+            return self._xml(connection, twiml("<Reject/>"))
+        return self._xml(connection, self.voice_twiml(q) if route == "voice" else self.pin_twiml(q))
+
+    def _gather(self, prompt):
+        action = "https://%s%s/pin" % (self.public_host, self.base)
+        return ('<Gather input="dtmf" finishOnKey="#" timeout="10" method="GET" action=%s><Say>%s</Say></Gather>'
+                '<Hangup/>' % (quoteattr(action), escape(prompt)))
+
+    def voice_twiml(self, q) -> str:
+        return twiml(self._gather("Dot here. Enter your PIN, then press pound."))
+
+    def pin_twiml(self, q) -> str:
+        sid = q.get("CallSid", "")
+        ok, locked = self.guard.check(q.get("Digits", ""))
+        if ok:
+            self.tries.pop(sid, None)
+            tok = self.tokens.mint(sid)
+            url = "wss://%s%s/media" % (self.public_host, self.base)
+            return twiml("<Connect><Stream url=%s><Parameter name=\"token\" value=%s/></Stream></Connect><Hangup/>"
+                         % (quoteattr(url), quoteattr(tok)))
+        n = self.tries.get(sid, 0) + 1
+        self.tries[sid] = n
+        if len(self.tries) > 200:
+            self.tries.pop(next(iter(self.tries)))
+        log("wrong PIN (try %d)%s" % (n, ", locked" if locked else ""))
+        if n >= MAX_PIN_TRIES or locked:
+            return twiml("<Say>Goodbye.</Say><Hangup/>")
+        return twiml(self._gather("That PIN was not right. Try again."))
+
+    # --- Media Streams ---
+    async def handler(self, ws):
+        try:
+            await self.media_call(ws)
+        except Exception as e:   # one bad call never takes the bridge down
+            if type(e).__name__ not in ("ConnectionClosedError", "ConnectionClosedOK", "ConnectionClosed"):
+                log("call error: %s" % (str(e) or type(e).__name__)[:120])
+
+    async def media_call(self, ws):
+        from websockets.asyncio.client import connect
+        stream_sid = None
+        deadline = time.monotonic() + 10
+        while stream_sid is None:   # connected, then start (with the one-time token)
+            raw = await asyncio.wait_for(ws.recv(), max(0.1, deadline - time.monotonic()))
+            ev = json.loads(raw) if isinstance(raw, str) else {}
+            if ev.get("event") == "start":
+                token = (ev.get("start", {}).get("customParameters") or {}).get("token")
+                if not self.tokens.consume(token):
+                    log("refused: bad or expired stream token")
+                    await ws.close()
+                    return
+                stream_sid = ev.get("streamSid") or ev["start"].get("streamSid", "")
+        headers = {"Tailscale-User-Login": self.allowed_login} if self.allowed_login else None
+        async with connect(self.dot_url, additional_headers=headers, max_size=8 * 1024 * 1024) as dot:
+            await dot.send(json.dumps({"type": "auth", "pin": self.pin, "voice": "phone", "ears": "phone",
+                                       "client": "twilio"}))
+            if json.loads(await asyncio.wait_for(dot.recv(), 10)).get("type") != "auth_ok":
+                log("Dot refused the bridge sign-in")
+                await ws.close()
+                return
+            await dot.send(json.dumps({"type": "live", "on": True, "lang": "en-US"}))
+            log("call connected")
+            tasks = [asyncio.create_task(self._from_twilio(ws, dot)),
+                     asyncio.create_task(self._from_dot(ws, dot, stream_sid))]
+            try:
+                await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for t in tasks:
+                    t.cancel()
+                try:
+                    await dot.send(json.dumps({"type": "live", "on": False}))
+                except Exception:
+                    pass
+        await ws.close()
+        log("call ended")
+
+    async def _from_twilio(self, ws, dot):
+        up, acc = Upsampler8to16(), np.zeros(0, dtype=np.int16)
+        async for raw in ws:
+            ev = json.loads(raw) if isinstance(raw, str) else {}
+            kind = ev.get("event")
+            if kind == "stop":
+                return
+            if kind != "media" or ev.get("media", {}).get("track", "inbound") != "inbound":
+                continue
+            try:
+                frame = base64.b64decode(ev["media"]["payload"], validate=True)
+            except (KeyError, binascii.Error):
+                continue
+            acc = np.concatenate((acc, up.feed(mulaw_decode(frame))))
+            while len(acc) >= DOT_CHUNK:
+                await dot.send(acc[:DOT_CHUNK].astype("<i2").tobytes())
+                acc = acc[DOT_CHUNK:]
+
+    async def _from_dot(self, ws, dot, stream_sid):
+        down, out, live_up = Downsampler24to8(), b"", False
+        async for raw in dot:
+            if isinstance(raw, bytes):
+                continue   # classic-mode WAV replies are not used in a phone call (Live only)
+            try:
+                m = json.loads(raw)
+            except ValueError:
+                continue
+            kind = m.get("type")
+            if kind == "live_ok":
+                live_up = True
+            elif kind == "live_error" and not live_up:
+                log("Live did not start: %s" % str(m.get("text", ""))[:80])
+                return
+            elif kind == "live_audio":
+                try:
+                    pcm = base64.b64decode(m.get("b64", ""))
+                except (binascii.Error, ValueError):
+                    continue
+                out += mulaw_encode(down.feed(pcm))
+                while len(out) >= TW_FRAME:
+                    frame, out = out[:TW_FRAME], out[TW_FRAME:]
+                    await ws.send(json.dumps({"event": "media", "streamSid": stream_sid,
+                                              "media": {"payload": base64.b64encode(frame).decode()}}))
+            elif kind == "live_stop":   # barge-in: flush what Twilio still holds
+                out, down.rest = b"", b""
+                await ws.send(json.dumps({"event": "clear", "streamSid": stream_sid}))
+            # everything else is page UI (status, transcript, ...): ignored
+
+
+async def serve(bridge, host="127.0.0.1", port=8772):
+    from websockets.asyncio.server import serve as ws_serve
+    return await ws_serve(bridge.handler, host, port, process_request=bridge.process_request,
+                          max_size=1024 * 1024, ping_interval=20, ping_timeout=60)
+
+
+def from_config():
+    try:
+        pin = open(PIN_FILE).read().strip()
+    except OSError:
+        raise SystemExit("pin.txt is missing: start the Dot service once first")
+    return Bridge(pin, config.get("twilio_path_secret"), config.get("twilio_allowed_callers"),
+                  config.get("twilio_public_host"), allowed_login=os.environ.get("VOICE_ALLOWED_LOGIN", ""))
+
+
+async def run_forever():
+    bridge = from_config()
+    server = await serve(bridge, "127.0.0.1", int(config.get("twilio_port")))
+    log("listening on 127.0.0.1:%s" % config.get("twilio_port"))
+    await server.serve_forever()
+
+
+if __name__ == "__main__":
+    if "--run" not in sys.argv:
+        raise SystemExit("usage: python3 twilio_bridge.py --run")
+    try:
+        asyncio.run(run_forever())
+    except ValueError as e:
+        raise SystemExit(str(e))

@@ -1,12 +1,57 @@
 """Local speech to text. No audio and no transcript ever leaves this Mac."""
 import array
 import os
+import re
 import sys
+import zlib
 
 import config
 from audio import SAMPLE_RATE, is_hallucination, worth_transcribing
 
 INITIAL_PROMPT = config.get("stt_vocabulary")
+
+
+# R34: Whisper sometimes speaks its own prompt back, or a run of another script, when the audio is short or noisy.
+# Scripts she never speaks are dropped (English and Chinese stay: she mixes them); the vocabulary prompt is removed wherever
+# it shows up; a loop of repeated text is a hallucination. An empty result makes the caller fall back to the other transcript.
+_OTHER_SCRIPTS = re.compile(
+    "[\u0400-\u04ff\u0590-\u05ff\u0600-\u06ff\u0900-\u097f\u0e00-\u0e7f\u1100-\u11ff\u3040-\u30ff\uac00-\ud7af\u3130-\u318f]+")
+_ECHO_PHRASES = ("\u8bf7\u7528\u7b80\u4f53\u4e2d\u6587", "\u4ee5\u4e0b\u662f\u666e\u901a\u8bdd", "\u8bf7\u4e0d\u8981\u7ffb\u8bd1",
+                 "thank you for watching", "thanks for watching", "subtitles by", "please subscribe")
+_PUNCT = re.compile(r"[\s.,;:!?\u3001\u3002\uff0c\uff1b\uff1a\uff01\uff1f\"'()\[\]-]+")
+
+
+def _strip_chunk(text, chunk, to_sentence_end=False, min_chars=8):
+    """Remove one prompt chunk from the text, ignoring spaces and punctuation between its characters. Short chunks (a
+    single name) are kept: she may really say them."""
+    chars = [re.escape(c) for c in _PUNCT.sub("", chunk)]
+    if len(chars) < min_chars:
+        return text
+    sep = r"[\s.,;:!?\u3001\u3002\uff0c\uff1b\uff1a\uff01\uff1f]*"
+    pat = sep.join(chars) + (r"[^\u3002.!?\n]*[\u3002.!?]?" if to_sentence_end else "")
+    return re.sub(pat, " ", text, flags=re.I)
+
+
+def clean_transcript(text, prompt=None):
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    prompt = INITIAL_PROMPT if prompt is None else prompt
+    text = _OTHER_SCRIPTS.sub(" ", text)
+    for phrase in _ECHO_PHRASES:
+        text = _strip_chunk(text, phrase, to_sentence_end=True, min_chars=4)
+    if prompt:
+        text = _strip_chunk(text, str(prompt))
+        for chunk in re.split(r"[.,;\u3001\u3002\uff0c\uff1b\n]+", str(prompt)):
+            text = _strip_chunk(text, chunk)
+        norm_t, norm_p = _PUNCT.sub("", text).lower(), _PUNCT.sub("", str(prompt)).lower()
+        if len(norm_t) >= 12 and norm_t in norm_p:   # the whole answer is a piece of the prompt
+            return ""
+    text = " ".join(text.split())
+    raw = text.encode("utf-8")
+    if len(raw) >= 40 and len(zlib.compress(raw)) < len(raw) / 3.0:   # a loop, like Whisper's repeated phrase
+        return ""
+    return "" if is_hallucination(text) else text
 
 
 class SpeechToText:
@@ -94,8 +139,7 @@ class WhisperEngine(SpeechToText):
             segments, _info = handle.transcribe(audio, task="transcribe", initial_prompt=INITIAL_PROMPT,
                                                 vad_filter=True, condition_on_previous_text=False)
             text = " ".join(s.text.strip() for s in segments).strip()
-        text = _simplify(text)
-        return "" if is_hallucination(text) else text
+        return clean_transcript(_simplify(text))
 
 
 def available_engine() -> str:
@@ -170,7 +214,7 @@ class WhisperSpeechToText(SpeechToText):
                 raise
         if reply.get("error"):
             raise RuntimeError("speech worker error: " + str(reply["error"])[:300])
-        return str(reply.get("text") or "")
+        return clean_transcript(reply.get("text") or "")
 
     def warm(self):
         """Start the worker now so the model loads in the background."""
