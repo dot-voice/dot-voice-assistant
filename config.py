@@ -62,6 +62,15 @@ DEFAULTS = {
     "voiceprint_log": False,         # R42: score each turn against the owner voiceprint and log it (log-only, never blocks)
     "voiceprint_enforce": False,     # P25 phase 2: reserved, does nothing yet
     "twilio_port": 8772,             # phone bridge: local port (127.0.0.1 only)
+    "twilio_number": "",             # R47: the Dot number (E.164) calls are placed from; empty = call-back off
+    "twilio_creds_path": "",         # R47: folder added to sys.path to import the credentials module
+    "twilio_creds_module": "appt_sms",  # R47: module whose get_credentials() returns account_sid, key_sid, key_secret
+    "callback_on_reply": False,      # R47: phone her when a session answers a hand-off and no call is live
+    "callback_quiet": "21:00-08:00",  # R47: quiet hours (local, wraps midnight): Telegram only, no call
+    "callback_timezone": "America/Toronto",
+    "callback_min_gap_s": 1200,      # R47: at most one call-back per 20 minutes
+    "callback_max_per_day": 6,
+    "callback_window_s": 3600,       # R47: only replies to hand-offs made in the last 60 minutes
 }
 
 

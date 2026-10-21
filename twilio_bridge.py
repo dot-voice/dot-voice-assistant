@@ -21,6 +21,7 @@ import re
 import secrets
 import subprocess
 import sys
+import threading
 import time
 from hashlib import sha1
 from http import HTTPStatus
@@ -217,7 +218,7 @@ def log(msg):
 class Bridge:
     def __init__(self, pin, secret, allowed_callers, public_host, dot_url=DOT_URL, auth_token_fn=keychain_auth_token,
                  allowed_login="", guard=None, tokens=None, fallback_voice_url="", stale_s=0,
-                 auth_mode="pin", phrase_fn=keychain_phrase, greeting_name=""):
+                 auth_mode="pin", phrase_fn=keychain_phrase, greeting_name="", dot_number="", machine_fn=None):
         if len(secret or "") < MIN_SECRET_LEN:
             raise ValueError("twilio_path_secret must be at least %d characters" % MIN_SECRET_LEN)
         self.pin, self.secret = pin, secret
@@ -231,6 +232,8 @@ class Bridge:
         self.tries = {}   # CallSid -> wrong PINs so far
         self.base = "/tw/" + secret
         self.auth_mode, self.phrase_fn, self.greeting_name = auth_mode, phrase_fn, greeting_name
+        self.dot_number = str(dot_number or "")   # R47: our own number; an outbound call-back has From = this, To = an allowed caller
+        self.machine_fn = machine_fn              # R47: called (in a thread) when a machine answered a call-back
         self.fallback_voice_url = fallback_voice_url or ""   # other callers are sent here (her old call-forward service)
 
     # --- HTTP (TwiML) ---
@@ -267,13 +270,24 @@ class Bridge:
         if not self._signature_ok(request):
             log("refused: bad Twilio signature")
             return connection.respond(HTTPStatus.FORBIDDEN, "forbidden\n")
-        if q.get("From", "") not in self.allowed:   # an empty allowlist rejects everyone
+        if q.get("From", "") not in self.allowed and not self._own_callback(q):   # an empty allowlist rejects everyone
             log("refused: caller not on the allowlist")
             if route == "voice" and self.fallback_voice_url:
                 return self._xml(connection, twiml("<Redirect method=\"POST\">%s</Redirect>" % escape(self.fallback_voice_url)))
             return self._xml(connection, twiml("<Reject/>"))
+        if route == "voice" and self._own_callback(q) and (q.get("AnsweredBy", "").startswith("machine") or q.get("AnsweredBy") == "fax"):
+            log("call-back answered by a machine: hanging up")
+            if self.machine_fn:
+                threading.Thread(target=self.machine_fn, daemon=True).start()
+            return self._xml(connection, twiml("<Hangup/>"))
         body = {"voice": self.voice_twiml, "pin": self.pin_twiml, "phrase": self.phrase_twiml}[route](q)
         return self._xml(connection, body)
+
+    def _own_callback(self, q) -> bool:
+        """R47: a call Dot placed itself (Twilio REST): From is our number, To is an allowed caller. The secret path and the
+        Twilio signature still apply before this is reached."""
+        return bool(self.dot_number) and q.get("From", "") == self.dot_number and q.get("To", "") in self.allowed \
+            and str(q.get("Direction", "")).startswith("outbound")
 
     def _gather(self, prompt):
         action = "https://%s%s/pin" % (self.public_host, self.base)
@@ -462,6 +476,13 @@ async def serve(bridge, host="127.0.0.1", port=8772):
                           max_size=1024 * 1024, ping_interval=20, ping_timeout=60)
 
 
+def _machine_fn():
+    if not config.get("callback_on_reply"):
+        return None
+    import callback
+    return callback.on_machine
+
+
 def from_config():
     try:
         pin = open(PIN_FILE).read().strip()
@@ -471,7 +492,8 @@ def from_config():
                   config.get("twilio_public_host"), allowed_login=os.environ.get("VOICE_ALLOWED_LOGIN", ""),
                   fallback_voice_url=config.get("twilio_fallback_voice_url") or "",
                   stale_s=int(config.get("twilio_stale_s")) if config.get("twilio_reaper") else 0,
-                  auth_mode=config.get("twilio_auth"), greeting_name=str(config.get("owner")).split()[0] if config.get("owner") else "")
+                  auth_mode=config.get("twilio_auth"), greeting_name=str(config.get("owner")).split()[0] if config.get("owner") else "",
+                  dot_number=config.get("twilio_number") or "", machine_fn=_machine_fn())
 
 
 async def run_forever():

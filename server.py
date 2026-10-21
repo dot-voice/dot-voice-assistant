@@ -44,6 +44,7 @@ import propfacts  # noqa: E402
 import lastcall  # noqa: E402
 import nextevents  # noqa: E402
 import callrecap  # noqa: E402
+import callback  # noqa: E402
 from tts import FakeTextToSpeech, default_tts, find_and_store_qwen_key, QwenTextToSpeech  # noqa: E402
 import realtime  # noqa: E402
 import transfer  # noqa: E402
@@ -1724,9 +1725,25 @@ def fake_services(args):
     return svc
 
 
+async def callback_loop(svc, every_s=5):
+    """R47: look for session replies to hand-offs while no call is open; callback.tick decides (off unless callback_on_reply)."""
+    while True:
+        try:
+            if config.get("callback_on_reply"):
+                live = any(st.call is not None for st in svc.call_states)
+                items = await asyncio.to_thread(updates.pending, svc.updates_folder)
+                await asyncio.to_thread(callback.tick, live, items=items, aliases=ROLE_ALIASES, log_path=svc.turn_log)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log_exception("callback loop")
+        await asyncio.sleep(every_s)
+
+
 async def run_forever(args):
     svc = fake_services(args) if args.fake else real_services(args)
     server = await serve(svc, args.host, args.port)
+    svc.callback_task = asyncio.create_task(callback_loop(svc))
     print("voice-call listening on %s:%d (PIN in %s). Put HTTPS in front with: tailscale serve --bg %d"
           % (args.host, args.port, PIN_FILE, args.port), flush=True)
     await server.serve_forever()
