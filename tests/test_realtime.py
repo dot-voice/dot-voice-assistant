@@ -92,7 +92,7 @@ class LiveBridgeTest(unittest.IsolatedAsyncioTestCase):
         upd = self.ws.sent[0]
         self.assertEqual(upd["type"], "session.update")
         names = [t["name"] for t in upd["session"]["tools"]]
-        self.assertEqual(names, ["hand_off", "get_status", "cancel_hand_off", "transfer_call", "lookup", "ask_model", "send_to_phone", "next_events"])
+        self.assertEqual(names, ["hand_off", "get_status", "cancel_hand_off", "transfer_call", "lookup", "ask_model", "send_to_phone", "next_events", "last_call"])
         self.assertTrue(upd["session"]["voice"])
         self.assertIn("model=", self.url)
         await self.b.close()

@@ -128,7 +128,7 @@ class GeminiBridgeTest(unittest.IsolatedAsyncioTestCase):
         cfg = self.configs[0]
         self.assertEqual(cfg.speech_config.voice_config.prebuilt_voice_config.voice_name, self.b.voice)
         names = [f.name for f in cfg.tools[0].function_declarations]
-        self.assertEqual(names, ["hand_off", "get_status", "cancel_hand_off", "transfer_call", "lookup", "ask_model", "send_to_phone", "next_events"])
+        self.assertEqual(names, ["hand_off", "get_status", "cancel_hand_off", "transfer_call", "lookup", "ask_model", "send_to_phone", "next_events", "last_call"])
         self.assertIsNotNone(cfg.session_resumption)
         self.assertIsNotNone(cfg.context_window_compression.sliding_window)
         self.assertEqual(cfg.system_instruction.parts[0].text if hasattr(cfg.system_instruction, "parts")

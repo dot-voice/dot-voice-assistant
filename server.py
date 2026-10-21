@@ -41,6 +41,7 @@ import updates  # noqa: E402
 import askmodel  # noqa: E402
 import handoff as handoff_mod  # noqa: E402
 import propfacts  # noqa: E402
+import lastcall  # noqa: E402
 import nextevents  # noqa: E402
 import callrecap  # noqa: E402
 from tts import FakeTextToSpeech, default_tts, find_and_store_qwen_key, QwenTextToSpeech  # noqa: E402
@@ -646,6 +647,20 @@ class LiveTools:
         except Exception:
             out = "I could not read your calendar just now."
         log_line("live_tool=next_events n=%d ms=%d" % (n, int((time.monotonic() - t0) * 1000)), self.call.svc.turn_log)
+        return out
+
+    async def last_call(self, n=1):
+        """R46 (P28): the newest call recap(s), read-only. Never raises; recap content is never logged."""
+        t0 = time.monotonic()
+        cnt = -1
+        try:
+            rc = getattr(self.call.state, "recap", None)
+            skip = getattr(rc, "started", None)
+            log_dir = os.path.dirname(self.call.svc.turn_log)
+            out, cnt = await asyncio.to_thread(lastcall.last_recaps, log_dir, n if n else 1, skip)
+        except Exception:
+            out = "I could not read the last call recap just now."
+        log_line("live_tool=last_call n=%d ms=%d" % (cnt, int((time.monotonic() - t0) * 1000)), self.call.svc.turn_log)
         return out
 
     async def _ask_model_bg(self, key, question):

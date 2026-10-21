@@ -99,6 +99,12 @@ def build_tools():
                         "It cannot add or change events.",
          "parameters": {"type": "object", "properties": {
              "hours": {"type": "integer", "description": "How many hours ahead to look, default 12."}}}},
+        {"type": "function", "name": "last_call",
+         "description": "Read-only: the recap of the caller's previous call (what she asked, what was done, what is still open). "
+                        "Call it when the caller says continue where we left off, what did we talk about last time, or anything open "
+                        "from the last call. Say briefly what was discussed and the open items. n is how many recent calls, default 1.",
+         "parameters": {"type": "object", "properties": {
+             "n": {"type": "integer", "description": "How many recent calls to read, 1 to 3, default 1."}}}},
     ]
 
 
@@ -601,6 +607,13 @@ class LiveBridge:
             if not ev_fn:
                 return "The calendar is not available."
             return await ev_fn(args.get("hours"))
+        elif name == "last_call":   # R46: newest call recap(s); private, so sign-in is required
+            if not getattr(self, "signed_in", False):
+                return "Sign-in is needed before I can read your last call."
+            lc_fn = getattr(self.tools_impl, "last_call", None)
+            if not lc_fn:
+                return "The last call recap is not available."
+            return await lc_fn(args.get("n"))
         else:
             return "failed: unknown tool"
 
