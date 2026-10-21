@@ -20,9 +20,20 @@ def save(phrase, run=subprocess.run):
     return len(norm.split())
 
 
+def ask(prompt):
+    """Hidden input: a macOS dialog (works when run through clog without a terminal), else getpass."""
+    if sys.stdin.isatty():
+        return getpass.getpass(prompt)
+    script = 'text returned of (display dialog "%s" default answer "" with hidden answer with title "Dot")' % prompt
+    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        raise SystemExit("ERROR: dialog cancelled, nothing saved")
+    return r.stdout.rstrip("\n")
+
+
 def main():
-    a = getpass.getpass("Passphrase (hidden): ")
-    if a != getpass.getpass("Again: "):
+    a = ask("Dot passphrase (hidden, 3+ words):")
+    if a != ask("Same passphrase again:"):
         raise SystemExit("ERROR: the two entries differ, nothing saved")
     try:
         n = save(a)
