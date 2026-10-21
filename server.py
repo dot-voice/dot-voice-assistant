@@ -41,6 +41,7 @@ import updates  # noqa: E402
 import askmodel  # noqa: E402
 import handoff as handoff_mod  # noqa: E402
 import propfacts  # noqa: E402
+import callrecap  # noqa: E402
 from tts import FakeTextToSpeech, default_tts, find_and_store_qwen_key, QwenTextToSpeech  # noqa: E402
 import realtime  # noqa: E402
 import transfer  # noqa: E402
@@ -79,6 +80,7 @@ class CallState:
         self.ask_tasks = set()     # R30: second-opinion calls still running
         self.tokens = set()        # every reconnect token issued in this call
         self.call = None           # the Call using it now
+        self.recap = None          # R38/R39: callrecap.CallRecap of the Live call in progress
         self.last_used = time.time()
 
 CHANNEL_ROWS_MAX = 10
@@ -563,6 +565,8 @@ class LiveTools:
         return "No saved status for that."
 
     async def lookup(self, words):
+        if self.call.state.recap:
+            self.call.state.recap.note_lookup(words)
         if propfacts.is_property_question(words):   # R35: property facts first, from the Vault lookup, in seconds
             facts = await propfacts.lookup(words)
             if facts:
@@ -618,6 +622,7 @@ class Call:
         self.started_at = time.strftime("%Y-%m-%d %H:%M:%S")
         self.bug = None
         self.bug_timer = None
+        self.client = ""
         self.svc.last_call = self   # tests reach the live Call through this
 
     @property
@@ -686,9 +691,35 @@ class Call:
                     return
         line = {"role": role, "text": text}
         line.update({k: v for k, v in tags.items() if v is not None})
+        if role == "user" and self.state.recap:
+            self.state.recap.note_turn()
         self.history.append(line)
         del self.history[:-HISTORY_MAX]
         self.state.last_used = time.time()
+
+    def recap_start(self):
+        """R38/R39: a Live call begins (flags off = nothing tracked)."""
+        if (config.get("call_recap") or config.get("call_summary_line")) and not self.state.recap:
+            self.state.recap = callrecap.CallRecap(bridge_call=self.client == "twilio")
+
+    async def recap_finish(self):
+        """R38/R39: the Live call ended: summary line, recap file, optional Telegram copy. Never raises into the call."""
+        rc, self.state.recap = self.state.recap, None
+        if rc is None:
+            return
+        try:
+            log_dir = os.path.dirname(self.svc.turn_log)
+            if config.get("call_summary_line"):
+                log_line(rc.summary_line(), self.svc.turn_log)
+            if config.get("call_recap"):
+                text = rc.build(list(self.history), list(self.state.channel_rows), lambda k: dict(TARGETS).get(k, k))
+                path = await asyncio.to_thread(callrecap.write_recap, log_dir, text)
+                log_line("call_recap: written %s" % os.path.basename(path), self.svc.turn_log)
+                if config.get("call_recap_telegram"):
+                    ok = await asyncio.to_thread(callrecap.send_telegram, text, config.get("call_recap_telegram_chat_id"))
+                    log_line("call_recap: telegram %s" % ("sent" if ok else "not sent"), self.svc.turn_log)
+        except Exception as e:
+            log_line("call_recap: failed (%s)" % (str(e) or type(e).__name__)[:80], self.svc.turn_log)
 
     def seed_lines(self):
         """The last lines of this call for a new Live session (reconnect, Live off-on, provider switch)."""
@@ -768,6 +799,8 @@ class Call:
             if stopped_at is not None:
                 ms = int((time.monotonic() - stopped_at) * 1000)
                 log_line("live first_audio_ms=%d" % ms, self.svc.turn_log)
+                if self.state.recap:
+                    self.state.recap.note_first_audio(ms)
                 if self.live:
                     self.live.stopped_at = None
             b64 = base64.b64encode(item).decode("ascii")
@@ -839,6 +872,7 @@ class Call:
         else:
             locked = self.svc.guard.locked_for()   # nothing to check (e.g. stale token only): refuse, do not count
         self.phone_voice = msg.get("voice") == "phone"
+        self.client = str(msg.get("client") or "")[:20]
         self.ears = "phone" if msg.get("ears") == "phone" else "mac"
         if not self.state.target_set:   # R28: after a spoken transfer the server's channel wins over the page's old pick
             self.target = msg.get("target") if msg.get("target") in TARGET_KEYS else "AUTO"
@@ -1273,6 +1307,7 @@ class Call:
                                 self.live_pending = False
                                 await self.send({"type": "live_ok"})
                                 log_line("live: on (%s)" % self.live_lang, self.svc.turn_log)
+                                self.recap_start()
                             except Exception as e:
                                 self.live = None
                                 self.live_pending = False
@@ -1286,6 +1321,7 @@ class Call:
                                 await self.live.close()
                                 self.live = None
                                 log_line("live: off", self.svc.turn_log)
+                            await self.recap_finish()
                     elif kind == "barge":   # Live: the phone heard her over Dot and stopped playing
                         if self.live and hasattr(self.live, "barge"):
                             await self.live.barge()
@@ -1348,6 +1384,8 @@ class Call:
                 except Exception:
                     pass
                 self.live = None
+            if not self.replaced:
+                await self.recap_finish()
                 log_line("live: off", self.svc.turn_log)
             if not self.replaced:
                 await LiveTools(self).post_pending()

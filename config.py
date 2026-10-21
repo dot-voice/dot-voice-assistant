@@ -48,6 +48,14 @@ DEFAULTS = {
     "twilio_allowed_callers": [],    # phone bridge: E.164 numbers allowed to call; empty = reject everyone
     "twilio_public_host": "",        # phone bridge: public host name of the Funnel, e.g. host.tailnet.ts.net
     "twilio_fallback_voice_url": "",  # phone bridge: callers not on the allowlist are redirected here (empty = reject)
+    "call_recap": False,             # R38: write logs/recaps/<date>-<time>.md when a Live call ends
+    "call_recap_telegram": False,    # R38: also send the recap to Telegram (token: Keychain item of the WeChat bot)
+    "telegram_keychain_service": "dot-telegram-bot-token",  # R38: Keychain service holding the bot token
+    "telegram_keychain_account": "",  # R38: Keychain account of that item
+    "call_recap_telegram_chat_id": "",  # R38: Telegram chat id (empty = $VHBOT_CHAT_ID, else not sent)
+    "call_summary_line": False,      # R39: one call_summary line in turns.log when a Live call ends
+    "twilio_reaper": False,          # R39: close a bridge call with no media for twilio_stale_s seconds
+    "twilio_stale_s": 120,
     "twilio_port": 8772,             # phone bridge: local port (127.0.0.1 only)
 }
 

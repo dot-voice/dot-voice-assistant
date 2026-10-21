@@ -146,7 +146,7 @@ def log(msg):
 # ------------------------------------------------------------------ the bridge
 class Bridge:
     def __init__(self, pin, secret, allowed_callers, public_host, dot_url=DOT_URL, auth_token_fn=keychain_auth_token,
-                 allowed_login="", guard=None, tokens=None, fallback_voice_url=""):
+                 allowed_login="", guard=None, tokens=None, fallback_voice_url="", stale_s=0):
         if len(secret or "") < MIN_SECRET_LEN:
             raise ValueError("twilio_path_secret must be at least %d characters" % MIN_SECRET_LEN)
         self.pin, self.secret = pin, secret
@@ -155,6 +155,8 @@ class Bridge:
         self.auth_token_fn, self.allowed_login = auth_token_fn, allowed_login
         self.guard = guard or PinGuard(pin)
         self.tokens = tokens or StreamTokens()
+        self.stale_s = stale_s   # R39: a call with no media from Twilio for this long is closed (0 = off)
+        self.last_media = time.monotonic()
         self.tries = {}   # CallSid -> wrong PINs so far
         self.base = "/tw/" + secret
         self.fallback_voice_url = fallback_voice_url or ""   # other callers are sent here (her old call-forward service)
@@ -260,6 +262,9 @@ class Bridge:
             log("call connected")
             tasks = [asyncio.create_task(self._from_twilio(ws, dot)),
                      asyncio.create_task(self._from_dot(ws, dot, stream_sid))]
+            self.last_media = time.monotonic()
+            if self.stale_s:
+                tasks.append(asyncio.create_task(self._reaper(self.stale_s)))
             try:
                 await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             finally:
@@ -272,6 +277,15 @@ class Bridge:
         await ws.close()
         log("call ended")
 
+    async def _reaper(self, stale_s):
+        """R39: Twilio sends media all the time on a live call; none for stale_s seconds means a dead call. Returning ends it."""
+        while True:
+            await asyncio.sleep(max(0.05, min(5.0, stale_s / 4.0)))
+            quiet = time.monotonic() - self.last_media
+            if quiet >= stale_s:
+                log("stale call closed: no media for %d s" % int(quiet))
+                return
+
     async def _from_twilio(self, ws, dot):
         up, acc = Upsampler8to16(), np.zeros(0, dtype=np.int16)
         async for raw in ws:
@@ -281,6 +295,7 @@ class Bridge:
                 return
             if kind != "media" or ev.get("media", {}).get("track", "inbound") != "inbound":
                 continue
+            self.last_media = time.monotonic()
             try:
                 frame = base64.b64decode(ev["media"]["payload"], validate=True)
             except (KeyError, binascii.Error):
@@ -334,7 +349,8 @@ def from_config():
         raise SystemExit("pin.txt is missing: start the Dot service once first")
     return Bridge(pin, config.get("twilio_path_secret"), config.get("twilio_allowed_callers"),
                   config.get("twilio_public_host"), allowed_login=os.environ.get("VOICE_ALLOWED_LOGIN", ""),
-                  fallback_voice_url=config.get("twilio_fallback_voice_url") or "")
+                  fallback_voice_url=config.get("twilio_fallback_voice_url") or "",
+                  stale_s=int(config.get("twilio_stale_s")) if config.get("twilio_reaper") else 0)
 
 
 async def run_forever():
