@@ -3,3 +3,5 @@ mlx-whisper
 opencc-python-reimplemented
 webauthn
 google-genai>=2.29
+sherpa-onnx
+numpy

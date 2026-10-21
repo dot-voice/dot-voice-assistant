@@ -57,6 +57,8 @@ DEFAULTS = {
     "call_summary_line": False,      # R39: one call_summary line in turns.log when a Live call ends
     "twilio_reaper": False,          # R39: close a bridge call with no media for twilio_stale_s seconds
     "twilio_stale_s": 120,
+    "voiceprint_log": False,         # R42: score each turn against the owner voiceprint and log it (log-only, never blocks)
+    "voiceprint_enforce": False,     # P25 phase 2: reserved, does nothing yet
     "twilio_port": 8772,             # phone bridge: local port (127.0.0.1 only)
 }
 

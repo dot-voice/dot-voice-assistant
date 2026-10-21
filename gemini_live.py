@@ -10,6 +10,7 @@ import math
 import time
 
 import realtime
+import voiceprint
 import tts
 
 KEYCHAIN = "voice-call-gemini"
@@ -105,6 +106,9 @@ class GeminiBridge(realtime.LiveBridge):
         self._heard_sent = False
         self._in_turn = True         # she has the floor until Dot answers
         self._turn_buf = bytearray()
+        self.voice_channel = "web"   # R42: "phone" for the Twilio bridge (set by the server)
+        self.signed_in = False       # R42: the call passed sign-in (the server sets it)
+        self._vp_tasks = set()
         self._said = ""
         self._activity_at = 0.0      # last sign of her voice (VAD start or words)
         self._draining = 0.0         # cancel(): time the dropped reply started draining (until its turn_complete)
@@ -497,12 +501,32 @@ class GeminiBridge(realtime.LiveBridge):
         if self.stopped_at is None:   # her last words (no VAD end event) or now
             self.stopped_at = self._activity_at if self._activity_at else time.monotonic()
         self.turn_pcm = bytes(self._turn_buf)
+        self._voiceprint_turn(self.turn_pcm)
         self.response_active = True
         self._turn_ended = time.monotonic()
         if self._heard.strip():
             self._turn_transcript = self.last_heard = self._turn_words = self._heard.strip()
             self._transcript_done.set()
             await self._send_heard()
+
+    def _voiceprint_turn(self, pcm):
+        """R42: score this turn against the owner voiceprint (log only). Runs in a worker thread as a background task: the
+        reply path never waits for it and never sees its errors. voiceprint_enforce: TODO phase 2 (check at call start and
+        before private tools); it does nothing yet."""
+        if not voiceprint.enabled() or not pcm:
+            return
+        channel, signed_in = self.voice_channel, self.signed_in
+
+        async def run():
+            try:
+                line = await asyncio.get_running_loop().run_in_executor(None, voiceprint.process_turn, channel, pcm, signed_in)
+                if line:
+                    self._log_line(line)
+            except Exception as e:
+                self._log_line("voiceprint: error %s" % (str(e) or type(e).__name__)[:80])
+        task = asyncio.ensure_future(run())
+        self._vp_tasks.add(task)
+        task.add_done_callback(self._vp_tasks.discard)
 
     async def _send_heard(self):
         if not self._heard_sent and self._heard.strip():

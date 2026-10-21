@@ -755,6 +755,8 @@ class Call:
             bridge.seed = self.seed_lines()   # what this call said so far: a new session must not forget it
             self.state.tag_base += 100000     # its turn / reply numbers never match an older session's lines
             bridge._turn_no = bridge._reply_no = self.state.tag_base
+            bridge.voice_channel = getattr(self, "source", "web")   # R42 (log-only voiceprint)
+            bridge.signed_in = True   # a Live call exists only after PIN / passkey / phone sign-in
             bridge.language = self.live_lang   # the page's ZH/EN choice: a hint for the provider's ears
             try:
                 await asyncio.wait_for(bridge.start(), 6)   # never block the call on a silent provider
@@ -874,6 +876,7 @@ class Call:
             locked = self.svc.guard.locked_for()   # nothing to check (e.g. stale token only): refuse, do not count
         self.phone_voice = msg.get("voice") == "phone"
         self.client = str(msg.get("client") or "")[:20]
+        self.source = "phone" if (msg.get("source") == "phone" or self.client == "twilio") else "web"   # R42: which voiceprint profile
         self.ears = "phone" if msg.get("ears") == "phone" else "mac"
         if not self.state.target_set:   # R28: after a spoken transfer the server's channel wins over the page's old pick
             self.target = msg.get("target") if msg.get("target") in TARGET_KEYS else "AUTO"

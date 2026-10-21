@@ -12,3 +12,5 @@ brain.txt
 *.crt
 static/dot/*.jpg
 .claude/
+models/
+data/

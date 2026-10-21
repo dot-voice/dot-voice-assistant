@@ -372,7 +372,7 @@ class Bridge:
         headers = {"Tailscale-User-Login": self.allowed_login} if self.allowed_login else None
         async with connect(self.dot_url, additional_headers=headers, max_size=8 * 1024 * 1024) as dot:
             await dot.send(json.dumps({"type": "auth", "pin": self.pin, "voice": "phone", "ears": "phone",
-                                       "client": "twilio"}))
+                                       "client": "twilio", "source": "phone"}))
             if json.loads(await asyncio.wait_for(dot.recv(), 10)).get("type") != "auth_ok":
                 log("Dot refused the bridge sign-in")
                 await ws.close()
