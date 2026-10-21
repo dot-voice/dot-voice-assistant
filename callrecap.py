@@ -48,6 +48,7 @@ class CallRecap:
         self.turns = 0
         self.first_audio_ms = []
         self.lookups = []
+        self.talk_used = False
 
     def note_turn(self):
         self.turns += 1
@@ -57,6 +58,9 @@ class CallRecap:
 
     def note_lookup(self, words):
         self.lookups.append(short(words, 80))
+
+    def note_talk(self):
+        self.talk_used = True
 
     def secs(self):
         return int(max(0, self.clock() - self.started))
@@ -75,7 +79,7 @@ class CallRecap:
         secs = self.secs()
         out = ["# Call recap", "", "- Started: %s" % started,
                "- Duration: %d min %d s%s" % (secs // 60, secs % 60, " (phone call)" if self.bridge_call else " (call page)")]
-        asked = [short(h["text"]) for h in history if h.get("role") == "user" and str(h.get("text", "")).strip()]
+        asked = [short(h["text"]) for h in history if h.get("role") == "user" and not h.get("talk") and str(h.get("text", "")).strip()]
         out += ["", "## What she asked"] + (["- " + a for a in asked[-12:]] or ["- (nothing recorded)"])
         did = []
         for r in rows:
@@ -83,6 +87,8 @@ class CallRecap:
                     "cancelled": "cancelled"}.get(r.get("status"), "did not go through")
             did.append("- Hand-off to %s: %s (%s)" % (label_of(r.get("key", "AUTO")), short(r.get("snippet", ""), 60), note))
         did += ["- Lookup: %s" % w for w in self.lookups[-10:]]
+        if self.talk_used:
+            did.append("- talk mode used")
         out += ["", "## What Dot did"] + (did or ["- Nothing handed off or looked up."])
         open_items = ["- Waiting on %s: %s" % (label_of(r.get("key", "AUTO")), short(r.get("snippet", ""), 60))
                       for r in rows if r.get("status") in ("sent", "waiting")]

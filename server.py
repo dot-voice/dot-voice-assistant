@@ -85,6 +85,7 @@ class CallState:
         self.ask_tasks = set()     # R30: second-opinion calls still running
         self.tokens = set()        # every reconnect token issued in this call
         self.call = None           # the Call using it now
+        self.talk = False          # P30: talk-it-through mode is on (a flag only; her words are tagged and kept out of the recap)
         self.recap = None          # R38/R39: callrecap.CallRecap of the Live call in progress
         self.last_used = time.time()
 
@@ -677,9 +678,24 @@ class LiveTools:
         log_line("live_tool=unread_digest n=%d ms=%d" % (n, int((time.monotonic() - t0) * 1000)), self.call.svc.turn_log)
         return out
 
+    async def talk_mode(self, on=True):
+        """P30: set the talk-it-through flag. Logs only "mode: talk on/off", never any content. Never raises."""
+        st = self.call.state
+        on = bool(on)
+        if on and not st.talk:
+            for line in reversed(st.history[-2:]):   # the line that made her say it belongs to talk mode too
+                if line.get("role") == "user":
+                    line["talk"] = True
+                    break
+        st.talk = on
+        if on and st.recap:
+            st.recap.note_talk()
+        log_line("mode: talk %s" % ("on" if on else "off"), self.call.svc.turn_log)
+        return "Okay, I'm here." if on else "Okay, back to work."
+
     async def _ask_model_bg(self, key, question):
         st = self.call.state
-        status, text, ms = await askmodel.ask(key, question, list(st.history))
+        status, text, ms = await askmodel.ask(key, question, list(h for h in st.history if not h.get("talk")))
         log_line("ask_model: %s ms=%d %s" % (key, ms, status), self.call.svc.turn_log)
         if status == "ok":
             st.notices.append("%s says: %s" % (key.capitalize(), text))
@@ -771,6 +787,8 @@ class Call:
                     return
         line = {"role": role, "text": text}
         line.update({k: v for k, v in tags.items() if v is not None})
+        if self.state.talk:
+            line["talk"] = True   # P30: kept for the call's own memory, never in the recap
         if role == "user" and self.state.recap:
             self.state.recap.note_turn()
         self.history.append(line)
@@ -1095,7 +1113,7 @@ class Call:
         if not st.via_transfer or self.target in ("AUTO", "VOICE"):
             return None
         mine = " ".join(str(words or "").split())
-        lines = [l for l in self.history if l["role"] == "user" and " ".join(l["text"].split()) != mine
+        lines = [l for l in self.history if l["role"] == "user" and not l.get("talk") and " ".join(l["text"].split()) != mine
                  and not transfer.is_suggestion_chatter(l)][-3:]   # R36: her lines only, never Dot's own filler replies
         if not lines:
             return None

@@ -111,10 +111,31 @@ def build_tools():
                         "Say the count and the first two or three items briefly. since_hours is how far back, default 12. It cannot send or reply.",
          "parameters": {"type": "object", "properties": {
              "since_hours": {"type": "integer", "description": "How many hours back to look, default 12."}}}},
+        {"type": "function", "name": "talk_mode",
+         "description": "Switch talk-it-through mode. on=true when the caller says she just needs to talk, she is stressed, can we just talk, "
+                        "or clearly sounds upset; on=false when she says back to work or asks for a work task. It only sets a private flag "
+                        "(nothing she says in talk mode is kept in the call recap). Then continue the conversation in the right style; "
+                        "never mention the flag.",
+         "parameters": {"type": "object", "properties": {
+             "on": {"type": "boolean", "description": "True to enter talk mode, false to leave it."}}, "required": ["on"]}},
     ]
 
 
 TOOLS = build_tools()
+
+TALK_MODE_PROMPT = (
+    " TALK-IT-THROUGH MODE (P30). Enter it when the caller says things like \"I just need to talk\", \"I'm stressed\", \"can we just talk\", "
+    "or clearly sounds upset: call talk_mode with on=true once, then follow this section. Leave it when she says \"back to work\" or asks for a "
+    "work task: call talk_mode with on=false and go back to the normal front desk style. In talk mode you are a warm, calm, unhurried "
+    "listener, not a front desk. Listen first. Reflect back what she said in one sentence. Ask one gentle question at a time. Keep every turn "
+    "short, one to three sentences, because she is driving. No lists, no lecturing, no toxic positivity, no \"everything will be fine\". Help her "
+    "name what is stressing her and, only if she wants it, find one small next step. You may offer a short slow-breathing exercise suited to "
+    "driving: eyes open and on the road, breathe in slowly for four, out slowly for six, a few times; never ask her to close her eyes. "
+    "Answer in the language she speaks, English or Mandarin Chinese. You are not a therapist: never diagnose and never give medical or "
+    "mental-health labels. In talk mode do not call hand_off, transfer_call, lookup, get_status or any work tool unless she asks for one, and do not bring up work items, "
+    "clients, appointments or messages. Nothing she says in talk mode is kept in the call recap. SAFETY: if she mentions self-harm, not wanting "
+    "to be alive, or being in danger, respond with care, stay with her, do not rush, and gently tell her she can call or text 988 (Canada, 24/7) "
+    "or call 911 if she is in immediate danger. If she is driving and very upset, gently suggest pulling over somewhere safe.")
 
 
 def build_instructions(owner, channel=None, targets=None):
@@ -135,7 +156,7 @@ def build_instructions(owner, channel=None, targets=None):
         "session, back to Dot, or to the previous channel, call transfer_call (never hand_off) and say exactly the line its result gives. "
         "If hand_off returns \"not sent yet\" with a question, ask exactly that question and nothing else: on yes call transfer_call, "
         "on no or anything else call hand_off again. Never offer a transfer on your own, never for status questions, never when the caller "
-        "is already on a channel." + note + (transfer.live_hint(targets) if targets else "")
+        "is already on a channel." + TALK_MODE_PROMPT + note + (transfer.live_hint(targets) if targets else "")
     )
 
 
@@ -627,6 +648,11 @@ class LiveBridge:
             if not ud_fn:
                 return "The message digest is not available."
             return await ud_fn(args.get("since_hours"))
+        elif name == "talk_mode":   # P30: private flag only; needs no sign-in because it reads nothing
+            tm_fn = getattr(self.tools_impl, "talk_mode", None)
+            if not tm_fn:
+                return "Okay."
+            return await tm_fn(bool(args.get("on")))
         else:
             return "failed: unknown tool"
 
