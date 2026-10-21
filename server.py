@@ -355,8 +355,9 @@ class LiveTools:
         if transfer.is_prev_name(transfer.resolve_words_polite(channel)):
             res = ("prev",)
         else:
-            key = self.call.resolve_channel(channel)
-            res = ("to", key) if key else ("unknown", channel)
+            aliases, titles = self.call.transfer_names()
+            keys = transfer.resolve_words_all(channel, TARGETS, aliases, titles)
+            res = ("to", keys[0]) if len(keys) == 1 else (("ask", keys[:3]) if keys else ("unknown", channel))
         return await self._run(res, zh)
 
     async def _run(self, res, zh):
@@ -376,7 +377,7 @@ class LiveTools:
             await self.send_kept(ls)
         if kind != "moved":
             return "%s, target unchanged. Say exactly this and nothing else: \"%s\"" % (
-                "no previous channel" if res[0] == "prev" else "unknown channel", say)
+                "no previous channel" if res[0] == "prev" else ("channel name unclear" if res[0] == "ask" else "unknown channel"), say)
         if key == "AUTO":
             say = say if say != "Dot here." else "Dot here. Go ahead."   # R36: a two-word line was sometimes not spoken at all
             note = "The caller is back with you (Dot): speak the line aloud, then handle her requests as before."
@@ -744,7 +745,7 @@ class Call:
             bridge = cls(
                 self._live_out,
                 LiveTools(self),
-                realtime.build_instructions(config.get("owner"), self.target),
+                realtime.build_instructions(config.get("owner"), self.target, TARGETS),
                 transcribe=transcribe_fn,
                 on_closed=lambda h=holder: self._on_live_closed(h[0] if h else None),
                 turn_log=self.svc.turn_log,
@@ -967,6 +968,8 @@ class Call:
         """transfer.plan() result -> (kind, line to say, key). kind: "moved" | "unknown" (a prev with nothing to pop is "unknown")."""
         if res[0] == "unknown":
             return "unknown", transfer.unknown_say(TARGETS, zh), None
+        if res[0] == "ask":   # R41: the name fits two roles: ask, move nowhere
+            return "unknown", transfer.ask_say(res[1], TARGETS, zh), None
         if res[0] == "prev":
             key = self.pop_previous()
             if key is None:

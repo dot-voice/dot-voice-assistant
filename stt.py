@@ -8,7 +8,21 @@ import zlib
 import config
 from audio import SAMPLE_RATE, is_hallucination, worth_transcribing
 
-INITIAL_PROMPT = config.get("stt_vocabulary")
+def _build_prompt():
+    """The configured vocabulary plus the channel names (R41), so Whisper spells Vault, Org, Site ... the way they are."""
+    base = str(config.get("stt_vocabulary") or "").strip()
+    try:
+        import handoff
+        import transfer
+        names = transfer.stt_hint(handoff.TARGETS)
+    except Exception:
+        names = ""
+    if names and names.lower() not in base.lower():
+        base = (base + " " if base else "") + "Channels: " + names + "."
+    return base
+
+
+INITIAL_PROMPT = _build_prompt()
 
 
 # R34: Whisper sometimes speaks its own prompt back, or a run of another script, when the audio is short or noisy.

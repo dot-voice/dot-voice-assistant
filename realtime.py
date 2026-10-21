@@ -8,6 +8,7 @@ import time
 import websockets
 
 import config
+import transfer
 import tts
 
 URL = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model="
@@ -65,7 +66,8 @@ def build_tools():
          "parameters": {"type": "object", "properties": {}}},
         {"type": "function", "name": "transfer_call",
          "description": "The caller asks to be transferred, put through or switched to a channel or session (or back to "
-                        "Dot, or to the previous channel). Pass the name she said. Never use hand_off for that.",
+                        "Dot, or to the previous channel). Pass the channel name she meant (speech recognition mishears VAULT as fault, volt, "
+                        "bolt, vote or wall; pass VAULT then). Never use hand_off for that.",
          "parameters": {"type": "object", "properties": {"channel": {
              "type": "string", "description": "The channel name as she said it, e.g. vault, website, market watch; \"Dot\" or \"back\" for the front desk; \"previous\" for the channel she was on before."}},
              "required": ["channel"]}},
@@ -86,7 +88,7 @@ def build_tools():
 TOOLS = build_tools()
 
 
-def build_instructions(owner, channel=None):
+def build_instructions(owner, channel=None, targets=None):
     note = ""
     if channel and channel not in ("AUTO", "VOICE"):   # R28: she was transferred to a channel (a new Live session keeps it)
         note = (f" The caller is on the {channel} channel; real work goes to {channel} (hand_off with no agent goes there). "
@@ -104,7 +106,7 @@ def build_instructions(owner, channel=None):
         "session, back to Dot, or to the previous channel, call transfer_call (never hand_off) and say exactly the line its result gives. "
         "If hand_off returns \"not sent yet\" with a question, ask exactly that question and nothing else: on yes call transfer_call, "
         "on no or anything else call hand_off again. Never offer a transfer on your own, never for status questions, never when the caller "
-        "is already on a channel." + note
+        "is already on a channel." + note + (transfer.live_hint(targets) if targets else "")
     )
 
 

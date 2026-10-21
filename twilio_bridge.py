@@ -71,29 +71,60 @@ def mulaw_encode(pcm: np.ndarray) -> bytes:
     return _MU_ENC[pcm.astype(np.int32) + 32768].tobytes()
 
 
+# Band-limited sample-rate conversion (v54). Before v54 the phone path used linear interpolation up (8k -> 16k) and a plain
+# average of 3 samples down (24k -> 8k): the average is a very weak low-pass (only ~6 dB down at 5 kHz), so high sounds folded
+# back into the voice band as a metallic hiss, and the interpolation added images. Now both directions use a long
+# linear-phase FIR (Kaiser window) in polyphase form, with the filter tail carried across chunks so frame edges are seamless.
+def _design_lowpass(cutoff_hz, rate_hz, taps):
+    from scipy.signal import firwin
+    return firwin(taps, cutoff_hz, window=("kaiser", 7.0), fs=rate_hz)
+
+
+_DOWN_TAPS = _design_lowpass(3900.0, 24000.0, 129)   # flat to 3.4 kHz, > 60 dB down from 4.4 kHz, group delay 2.7 ms
+_UP_TAPS = _design_lowpass(3900.0, 16000.0, 97)      # removes the 4-8 kHz images of the 2x zero-stuffing, delay 3 ms
+SOFT_KNEE = 28000.0
+
+
+def soft_limit(x: np.ndarray) -> np.ndarray:
+    """float samples -> int16 with a smooth knee above 28000 (filter overshoot never wraps or hard-clips)."""
+    a = np.abs(x)
+    room = 32767.0 - SOFT_KNEE
+    y = np.where(a > SOFT_KNEE, SOFT_KNEE + room * np.tanh((a - SOFT_KNEE) / room), a)
+    return np.rint(np.copysign(y, x)).astype(np.int16)
+
+
 class Upsampler8to16:
-    """8 kHz -> 16 kHz by linear interpolation; remembers the last sample so frame edges stay smooth."""
+    """8 kHz int16 -> 16 kHz int16: polyphase 2x interpolation with a low-pass; the filter tail is kept between frames."""
 
     def __init__(self):
-        self.prev = 0
+        self.h0 = _UP_TAPS[0::2] * 2.0
+        self.h1 = _UP_TAPS[1::2] * 2.0
+        self.hist = np.zeros(len(self.h0) - 1)
 
     def feed(self, pcm8: np.ndarray) -> np.ndarray:
         if not len(pcm8):
             return np.zeros(0, dtype=np.int16)
-        cur = pcm8.astype(np.int32)
-        before = np.concatenate(([self.prev], cur[:-1]))
-        out = np.empty(len(cur) * 2, dtype=np.int32)
-        out[0::2] = (before + cur) // 2
-        out[1::2] = cur
-        self.prev = int(cur[-1])
-        return out.astype(np.int16)
+        buf = np.concatenate((self.hist, pcm8.astype(np.float64)))
+        n = len(pcm8)
+        k = len(self.h0)
+        out = np.empty(2 * n)
+        out[0::2] = np.convolve(buf, self.h0, "valid")[:n]
+        out[1::2] = np.convolve(buf, self.h1[:k] if len(self.h1) == k else np.append(self.h1, 0.0), "valid")[:n]
+        self.hist = buf[len(buf) - (k - 1):]
+        return soft_limit(out)
 
 
 class Downsampler24to8:
-    """24 kHz 16-bit PCM bytes -> 8 kHz int16: average each group of 3 samples (a low-pass, no aliasing)."""
+    """24 kHz 16-bit PCM bytes -> 8 kHz int16: low-pass FIR evaluated only at every third sample (polyphase); the filter
+    tail and the leftover odd bytes / samples are kept between chunks, so no sample is dropped or repeated."""
 
     def __init__(self):
         self.rest = b""
+        self.hist = np.zeros(len(_DOWN_TAPS) - 1)
+
+    def reset(self):
+        self.rest = b""
+        self.hist = np.zeros(len(_DOWN_TAPS) - 1)
 
     def feed(self, data: bytes) -> np.ndarray:
         data = self.rest + data
@@ -101,8 +132,13 @@ class Downsampler24to8:
         self.rest = data[n:]
         if not n:
             return np.zeros(0, dtype=np.int16)
-        x = np.frombuffer(data[:n], dtype="<i2").astype(np.int32).reshape(-1, 3)
-        return (x.sum(axis=1) // 3).astype(np.int16)
+        x = np.frombuffer(data[:n], dtype="<i2").astype(np.float64)
+        buf = np.concatenate((self.hist, x))
+        taps = len(_DOWN_TAPS)
+        win = np.lib.stride_tricks.sliding_window_view(buf, taps)[::3]   # one row per output sample
+        y = win @ _DOWN_TAPS[::-1]
+        self.hist = buf[len(buf) - (taps - 1):]
+        return soft_limit(y)
 
 
 # ------------------------------------------------------------------ security helpers
@@ -414,7 +450,8 @@ class Bridge:
                     await ws.send(json.dumps({"event": "media", "streamSid": stream_sid,
                                               "media": {"payload": base64.b64encode(frame).decode()}}))
             elif kind == "live_stop":   # barge-in: flush what Twilio still holds
-                out, down.rest = b"", b""
+                out = b""
+                down.reset()
                 await ws.send(json.dumps({"event": "clear", "streamSid": stream_sid}))
             # everything else is page UI (status, transcript, ...): ignored
 

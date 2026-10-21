@@ -11,6 +11,60 @@ CJK = re.compile(r"[\u4e00-\u9fff]")
 # Built-in aliases (also read from roles.json "_aliases" at runtime). Undirected: either name finds the other.
 BUILTIN_ALIASES = [("CRM", "VAULT"), ("VIDEO", "MW"), ("\u7f51\u7ad9", "WEBSITE"), ("\u7814\u7a76", "RESEARCH"),
                    ("\u89c6\u9891", "VIDEO")]
+# R41: sound-alike names. Phone speech-to-text often hears "vault" as "fault", "volt" or "bolt". Per role: the TARGETS keys
+# it can be (any one that exists) and the phrases (normalized, spaces and punctuation dropped) that mean it.
+SOUND_ALIASES = {
+    "VAULT": (("VAULT",), ("vault", "vaults", "fault", "faults", "volt", "bolt", "vote", "valt", "vaul", "walt", "wall",
+                           "world", "thevault", "involved", "evolve", "vaultchannel", "bolts", "volts", "boat", "folt")),
+    "ORG": (("ORG",), ("organization", "organisation", "org", "or", "orgchannel", "theorg", "organizations")),
+    "CRM": (("CRM",), ("crm", "c r m", "cerem", "seearem", "seearm", "searem", "cr m", "crms")),
+    "SITE": (("SITE", "WEBSITE"), ("site", "sight", "website", "cite", "web site", "thesite", "thewebsite", "sites")),
+    "WX": (("WX", "WECHAT"), ("wx", "w x", "wechat", "we chat", "doubleyouex", "doubleux", "dubyouex", "weechat", "wechats")),
+    "REFARM": (("REFARM",), ("refarm", "re farm", "reform", "refund", "refarms", "refom", "reform ")),
+    "SOCIAL": (("SOCIAL",), ("social", "socials", "socialmedia", "sosial")),
+}
+# A lone filler word is only a role when it is the whole name and nothing else fits ("fall" -> VAULT).
+LONE_ONLY = {"VAULT": ("fall", "fell", "vol")}
+FUZZY_RATIO = 0.8
+FUZZY_MIN_LEN = 4
+
+
+def _sound_table():
+    """normalized phrase -> role group name."""
+    t = {}
+    for role, (_keys, phrases) in SOUND_ALIASES.items():
+        for p in phrases:
+            t.setdefault(norm(p), role)
+        t.setdefault(norm(role), role)
+    return t
+
+
+def _present_roles(targets):
+    return [(role, _group_keys(role, targets)[0]) for role in SOUND_ALIASES if _group_keys(role, targets)]
+
+
+def stt_hint(targets):
+    """R41: the channel names for the Whisper vocabulary prompt ("Vault, Org, Site, ..."), only roles that exist."""
+    return ", ".join(spoken_label(k, targets) for _r, k in _present_roles(targets))
+
+
+def live_hint(targets):
+    """R41: one sentence for the Gemini Live instructions: the channel names and what speech recognition may hear instead."""
+    parts = []
+    for role, key in _present_roles(targets):
+        alt = [p for p in SOUND_ALIASES[role][1][:7] if norm(p) != norm(key) and len(norm(p)) >= 3 and " " not in p]
+        parts.append("%s (may be heard as %s)" % (key, ", ".join(alt[:6])) if alt else key)
+    if not parts:
+        return ""
+    return (" Channel names the caller may say: " + "; ".join(parts) + ". Speech recognition often mishears them, so for transfer_call "
+            "pass the channel name you think she meant (for example \"fault\" or \"volt\" means VAULT), not the misheard word.")
+
+
+def _group_keys(role, targets):
+    have = {k for k, _ in targets}
+    return [k for k in SOUND_ALIASES[role][0] if k in have]
+
+
 BACK_WORDS = {"back", "dot", "auto", "frontdesk", "main", "mainline", "mainmenu", "\u524d\u53f0", "\u603b\u53f0"}
 LABEL_STOP = {"this", "call", "dot", "auto", "the", "and"}
 POLITE = {"please", "now", "channel", "session", "chat", "thanks", "thank", "you", "for", "me", "ok", "okay", "line"}
@@ -115,6 +169,92 @@ def resolve(name, targets, aliases=(), titles=None, fuzzy=True):
     return None
 
 
+def resolve_all(name, targets, aliases=(), titles=None):
+    """R41: every TARGETS key a spoken name can mean (usually 0 or 1). Order: exact key / label / alias, then the sound-alike
+    table, then a close spelling (difflib ratio >= 0.8, or the same metaphone-like code). Two different roles -> both are
+    returned, so the caller asks instead of guessing."""
+    n = norm(name)
+    if not n or CJK.search(n):
+        return [k for k in [resolve(name, targets, aliases, titles)] if k]
+    first = resolve(name, targets, aliases, titles, fuzzy=False)
+    if first:
+        return [first]
+    table = _sound_table()
+    role = table.get(n)
+    if role:
+        keys = _group_keys(role, targets)
+        if keys:
+            return keys[:1]
+    for role, words in LONE_ONLY.items():
+        if n in words and _group_keys(role, targets):
+            return _group_keys(role, targets)[:1]
+    # fuzzy fallback over the sound-alike words and the real keys / labels
+    cand = candidates(targets, titles)
+    scored = {}
+    pool = [(w, r) for w, r in table.items() if len(w) >= FUZZY_MIN_LEN and _group_keys(r, targets)]
+    pool += [(w, k) for w, k in cand.items() if len(w) >= FUZZY_MIN_LEN and not CJK.search(w)]
+    code = _phonetic(n)
+    for w, r in pool:
+        key = _group_keys(r, targets)[0] if r in SOUND_ALIASES else r
+        ratio = difflib.SequenceMatcher(None, n, w).ratio()
+        if len(n) >= FUZZY_MIN_LEN and (ratio >= FUZZY_RATIO or (code and code == _phonetic(w) and len(code) >= 3)):
+            scored[key] = max(scored.get(key, 0), ratio)
+    if not scored:
+        leg = resolve(name, targets, aliases, titles)   # the older fuzzy (cutoff 0.75) still applies as a last try
+        return [leg] if leg else []
+    top = max(scored.values())
+    return [k for k, v in sorted(scored.items(), key=lambda kv: -kv[1]) if top - v < 0.1]
+
+
+_PH_RULES = (("ph", "f"), ("ck", "k"), ("q", "k"), ("x", "ks"), ("z", "s"), ("v", "f"), ("w", "f"), ("b", "p"), ("d", "t"),
+             ("g", "k"), ("c", "k"))
+
+
+def _phonetic(w):
+    """A crude metaphone: lower-case letters, merge look-alike consonants, drop vowels after the first letter and repeats."""
+    w = re.sub(r"[^a-z]", "", str(w).lower())
+    for a, b in _PH_RULES:
+        w = w.replace(a, b)
+    if not w:
+        return ""
+    out = w[0]
+    for ch in w[1:]:
+        if ch in "aeiouyh" or ch == out[-1]:
+            continue
+        out += ch
+    return out
+
+
+def ask_say(keys, targets, zh=False):
+    names = [spoken_label(k, targets) for k in keys]
+    if zh:
+        return "\u4f60\u662f\u6307 %s \u8fd8\u662f %s\uff1f" % (names[0], " \u8fd8\u662f ".join(names[1:]))
+    return "Did you mean %s?" % (" or ".join(names[:-1]) + " or " + names[-1] if len(names) > 2 else " or ".join(names))
+
+
+def _polite_trim(name):
+    name = " ".join(str(name or "").split())
+    for suffix in POLITE_ZH:
+        while name.endswith(suffix) and len(name) > len(suffix):
+            name = name[:-len(suffix)].strip()
+    words = name.split()
+    while words and words[-1].lower().strip("'") in POLITE:
+        words.pop()
+    if not words or len(words) > 4:
+        return None
+    return " ".join(words)
+
+
+def resolve_words_all(name, targets, aliases=(), titles=None):
+    full = " ".join(str(name or "").split())
+    if full and len(full.split()) <= 4:   # "we chat" ends in a polite word ("chat"): try the words as they are first
+        keys = resolve_all(full, targets, aliases, titles)
+        if len(keys) == 1 and norm(full) in set(_sound_table()) | set(candidates(targets, titles)):
+            return keys
+    n = _polite_trim(name)
+    return resolve_all(n, targets, aliases, titles) if n else []
+
+
 def resolve_words(name, targets, aliases=(), titles=None):
     """Like resolve(), after dropping polite words around the name ("the website please", "vault channel")."""
     name = " ".join(str(name or "").split())
@@ -126,7 +266,8 @@ def resolve_words(name, targets, aliases=(), titles=None):
         words.pop()
     if not words or len(words) > 4:
         return None
-    return resolve(" ".join(words), targets, aliases, titles)
+    keys = resolve_all(" ".join(words), targets, aliases, titles)
+    return keys[0] if len(keys) == 1 else None
 
 
 def _answer_key(text):
@@ -185,7 +326,7 @@ def resolve_words_polite(name):
 
 
 def plan(text, targets, aliases=(), titles=None):
-    """None (not a transfer), ("to", KEY), ("prev",) or ("unknown", name)."""
+    """None (not a transfer), ("to", KEY), ("prev",), ("ask", [KEYS]) (R41: the name fits two roles) or ("unknown", name)."""
     p = parse(text)
     if not p:
         return None
@@ -193,9 +334,11 @@ def plan(text, targets, aliases=(), titles=None):
         return ("prev",)
     if p["kind"] == "back":
         return ("to", "AUTO")
-    key = resolve_words(p["name"], targets, aliases, titles)
-    if key:
-        return ("to", key)
+    keys = resolve_words_all(p["name"], targets, aliases, titles)
+    if len(keys) == 1:
+        return ("to", keys[0])
+    if len(keys) > 1:
+        return ("ask", keys[:3])
     return ("unknown", p["name"]) if p["strong"] else None
 
 
