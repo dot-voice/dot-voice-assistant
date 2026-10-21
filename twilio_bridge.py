@@ -146,7 +146,7 @@ def log(msg):
 # ------------------------------------------------------------------ the bridge
 class Bridge:
     def __init__(self, pin, secret, allowed_callers, public_host, dot_url=DOT_URL, auth_token_fn=keychain_auth_token,
-                 allowed_login="", guard=None, tokens=None):
+                 allowed_login="", guard=None, tokens=None, fallback_voice_url=""):
         if len(secret or "") < MIN_SECRET_LEN:
             raise ValueError("twilio_path_secret must be at least %d characters" % MIN_SECRET_LEN)
         self.pin, self.secret = pin, secret
@@ -157,6 +157,7 @@ class Bridge:
         self.tokens = tokens or StreamTokens()
         self.tries = {}   # CallSid -> wrong PINs so far
         self.base = "/tw/" + secret
+        self.fallback_voice_url = fallback_voice_url or ""   # other callers are sent here (her old call-forward service)
 
     # --- HTTP (TwiML) ---
     def _xml(self, connection, body, status=HTTPStatus.OK):
@@ -194,6 +195,8 @@ class Bridge:
             return connection.respond(HTTPStatus.FORBIDDEN, "forbidden\n")
         if q.get("From", "") not in self.allowed:   # an empty allowlist rejects everyone
             log("refused: caller not on the allowlist")
+            if route == "voice" and self.fallback_voice_url:
+                return self._xml(connection, twiml("<Redirect method=\"POST\">%s</Redirect>" % escape(self.fallback_voice_url)))
             return self._xml(connection, twiml("<Reject/>"))
         return self._xml(connection, self.voice_twiml(q) if route == "voice" else self.pin_twiml(q))
 
@@ -330,7 +333,8 @@ def from_config():
     except OSError:
         raise SystemExit("pin.txt is missing: start the Dot service once first")
     return Bridge(pin, config.get("twilio_path_secret"), config.get("twilio_allowed_callers"),
-                  config.get("twilio_public_host"), allowed_login=os.environ.get("VOICE_ALLOWED_LOGIN", ""))
+                  config.get("twilio_public_host"), allowed_login=os.environ.get("VOICE_ALLOWED_LOGIN", ""),
+                  fallback_voice_url=config.get("twilio_fallback_voice_url") or "")
 
 
 async def run_forever():

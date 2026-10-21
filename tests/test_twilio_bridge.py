@@ -66,6 +66,16 @@ class TestBridgeHttp(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<Reject/>", body)
         self.assertNotIn("<Gather", body)
 
+    async def test_blocked_caller_is_redirected_to_the_old_voice_url_when_set(self):
+        old = "https://old.example/voice.php?client=V&greeting=a+b"
+        self.bridge.fallback_voice_url = old
+        status, body = await self.voice("+15559998888")
+        self.assertIn('<Redirect method="POST">https://old.example/voice.php?client=V&amp;greeting=a+b</Redirect>', body)
+        self.assertNotIn("<Gather", body)
+        _, body = await self.voice()   # the allowed caller still gets the PIN prompt
+        self.assertIn("<Gather", body)
+        self.assertNotIn("<Redirect", body)
+
     async def test_empty_allowlist_rejects_everyone(self):
         self.bridge.allowed = set()
         status, body = await self.voice()
