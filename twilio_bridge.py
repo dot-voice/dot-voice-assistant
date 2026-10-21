@@ -3,7 +3,7 @@ service exactly like the call page does (ws://127.0.0.1:8770/ws, Live mode) and 
 
 Run:  python3 twilio_bridge.py --run      (127.0.0.1:8772; expose only /tw/<secret> with `tailscale funnel`, see docs/PHONE.md)
 
-Security layers: secret path token, caller-ID allowlist, keypad PIN (3 tries), one-time per-call stream token (60 s),
+Security layers: secret path token, caller-ID allowlist, keypad PIN or spoken passphrase (twilio_auth, 3 tries), one-time per-call stream token (60 s),
 and the Twilio request signature when an auth token is stored in the Keychain (KEYCHAIN_ITEM below).
 
 Twilio is set to HTTP GET for the voice and PIN webhooks: the websockets server cannot read a POST body, and GET keeps this
@@ -13,9 +13,11 @@ to one small port and one library. Audio: Twilio is 8 kHz mu-law 20 ms frames; D
 import asyncio
 import base64
 import binascii
+import difflib
 import hmac
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -39,6 +41,10 @@ MIN_SECRET_LEN = 24
 DOT_CHUNK = 960          # samples of 16 kHz PCM per message to Dot (the page sends the same)
 TW_FRAME = 160           # 20 ms of 8 kHz mu-law
 KEYCHAIN_ITEM = "voice-call-twilio-auth"
+PHRASE_ITEM = "dot-voice-phrase"   # Keychain item holding the normalized spoken passphrase
+PHRASE_MIN_RATIO = 0.85
+PHRASE_LONG_WORD = 4               # every phrase word at least this long must be heard
+_STT_VARIANTS = {"okay": "ok", "hay": "hey", "a": "", "the": ""}   # tiny, applied to both sides
 
 
 # ------------------------------------------------------------------ audio
@@ -116,6 +122,34 @@ def keychain_auth_token():
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+def normalize_phrase(text) -> str:
+    """Lowercase, drop punctuation, collapse spaces, apply a few common speech-to-text variants."""
+    t = re.sub(r"[^a-z0-9\s]", "", str(text or "").lower().replace("'", ""))
+    words = [_STT_VARIANTS.get(w, w) for w in t.split()]
+    return " ".join(w for w in words if w)
+
+
+def phrase_score(spoken, stored):
+    """(ok, ratio): fuzzy ratio >= PHRASE_MIN_RATIO and every long word of the stored phrase was heard."""
+    a, b = normalize_phrase(spoken), normalize_phrase(stored)
+    if not a or not b:
+        return False, 0.0
+    ratio = difflib.SequenceMatcher(None, a, b).ratio()
+    heard = set(a.split())
+    long_ok = all(w in heard for w in b.split() if len(w) >= PHRASE_LONG_WORD)
+    return (ratio >= PHRASE_MIN_RATIO and long_ok), ratio
+
+
+def keychain_phrase():
+    """The stored passphrase from the Keychain, or "" when none is set."""
+    try:
+        r = subprocess.run(["security", "find-generic-password", "-s", PHRASE_ITEM, "-w"], capture_output=True,
+                           text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
 class StreamTokens:
     """One-time stream tokens minted after the PIN: single use, TTL seconds."""
 
@@ -146,7 +180,8 @@ def log(msg):
 # ------------------------------------------------------------------ the bridge
 class Bridge:
     def __init__(self, pin, secret, allowed_callers, public_host, dot_url=DOT_URL, auth_token_fn=keychain_auth_token,
-                 allowed_login="", guard=None, tokens=None, fallback_voice_url="", stale_s=0):
+                 allowed_login="", guard=None, tokens=None, fallback_voice_url="", stale_s=0,
+                 auth_mode="pin", phrase_fn=keychain_phrase, greeting_name=""):
         if len(secret or "") < MIN_SECRET_LEN:
             raise ValueError("twilio_path_secret must be at least %d characters" % MIN_SECRET_LEN)
         self.pin, self.secret = pin, secret
@@ -159,6 +194,7 @@ class Bridge:
         self.last_media = time.monotonic()
         self.tries = {}   # CallSid -> wrong PINs so far
         self.base = "/tw/" + secret
+        self.auth_mode, self.phrase_fn, self.greeting_name = auth_mode, phrase_fn, greeting_name
         self.fallback_voice_url = fallback_voice_url or ""   # other callers are sent here (her old call-forward service)
 
     # --- HTTP (TwiML) ---
@@ -186,7 +222,7 @@ class Bridge:
         if is_ws or not path.startswith("/tw/"):
             return connection.respond(HTTPStatus.NOT_FOUND, "not found\n")
         route = None
-        for name in ("voice", "pin"):
+        for name in ("voice", "pin", "phrase"):
             if hmac.compare_digest(path.encode(), ("%s/%s" % (self.base, name)).encode()):
                 route = name
         if route is None:
@@ -200,25 +236,70 @@ class Bridge:
             if route == "voice" and self.fallback_voice_url:
                 return self._xml(connection, twiml("<Redirect method=\"POST\">%s</Redirect>" % escape(self.fallback_voice_url)))
             return self._xml(connection, twiml("<Reject/>"))
-        return self._xml(connection, self.voice_twiml(q) if route == "voice" else self.pin_twiml(q))
+        body = {"voice": self.voice_twiml, "pin": self.pin_twiml, "phrase": self.phrase_twiml}[route](q)
+        return self._xml(connection, body)
 
     def _gather(self, prompt):
         action = "https://%s%s/pin" % (self.public_host, self.base)
         return ('<Gather input="dtmf" finishOnKey="#" timeout="10" method="GET" action=%s><Say>%s</Say></Gather>'
                 '<Hangup/>' % (quoteattr(action), escape(prompt)))
 
+    def _phrase_mode(self) -> bool:
+        if self.auth_mode != "phrase":
+            return False
+        if not self.phrase_fn():
+            log("twilio_auth=phrase but no passphrase is stored: falling back to the PIN")
+            return False
+        return True
+
+    def _gather_phrase(self, prompt):
+        action = "https://%s%s/phrase" % (self.public_host, self.base)
+        return ('<Gather input="speech dtmf" speechTimeout="auto" timeout="6" language="en-US" finishOnKey="#" '
+                'method="GET" action=%s><Say>%s</Say></Gather><Hangup/>' % (quoteattr(action), escape(prompt)))
+
     def voice_twiml(self, q) -> str:
+        if self._phrase_mode():
+            who = (" " + self.greeting_name) if self.greeting_name else ""
+            return twiml(self._gather_phrase("Hi%s." % who))
         return twiml(self._gather("Dot here. Enter your PIN, then press pound."))
+
+    def phrase_twiml(self, q) -> str:
+        """Speech goes to the phrase check, keypad digits to the PIN check; both share the PinGuard lockout."""
+        if q.get("Digits"):
+            return self.pin_twiml(q)
+        sid = q.get("CallSid", "")
+        stored = self.phrase_fn() if self.auth_mode == "phrase" else ""
+        left = self.guard.locked_for()
+        ok, score = (False, 0.0) if (left or not stored) else phrase_score(q.get("SpeechResult", ""), stored)
+        if ok:
+            log("phrase ok")
+            self.guard.reset()
+            return self._connect(sid)
+        locked = bool(left)
+        if not left and q.get("SpeechResult"):
+            _, locked_s = self.guard.record_failure()
+            locked = bool(locked_s)
+        log("phrase no match score=%.2f%s" % (score, ", locked" if locked else ""))
+        n = self.tries.get(sid, 0) + 1
+        self.tries[sid] = n
+        if len(self.tries) > 200:
+            self.tries.pop(next(iter(self.tries)))
+        if n >= MAX_PIN_TRIES or locked:
+            return twiml("<Say>Goodbye.</Say><Hangup/>")
+        return twiml(self._gather_phrase("Sorry, say it again."))
+
+    def _connect(self, sid):
+        self.tries.pop(sid, None)
+        tok = self.tokens.mint(sid)
+        url = "wss://%s%s/media" % (self.public_host, self.base)
+        return twiml("<Connect><Stream url=%s><Parameter name=\"token\" value=%s/></Stream></Connect><Hangup/>"
+                     % (quoteattr(url), quoteattr(tok)))
 
     def pin_twiml(self, q) -> str:
         sid = q.get("CallSid", "")
         ok, locked = self.guard.check(q.get("Digits", ""))
         if ok:
-            self.tries.pop(sid, None)
-            tok = self.tokens.mint(sid)
-            url = "wss://%s%s/media" % (self.public_host, self.base)
-            return twiml("<Connect><Stream url=%s><Parameter name=\"token\" value=%s/></Stream></Connect><Hangup/>"
-                         % (quoteattr(url), quoteattr(tok)))
+            return self._connect(sid)
         n = self.tries.get(sid, 0) + 1
         self.tries[sid] = n
         if len(self.tries) > 200:
@@ -226,6 +307,8 @@ class Bridge:
         log("wrong PIN (try %d)%s" % (n, ", locked" if locked else ""))
         if n >= MAX_PIN_TRIES or locked:
             return twiml("<Say>Goodbye.</Say><Hangup/>")
+        if self._phrase_mode():
+            return twiml(self._gather_phrase("That PIN was not right. Try again."))
         return twiml(self._gather("That PIN was not right. Try again."))
 
     # --- Media Streams ---
@@ -350,7 +433,8 @@ def from_config():
     return Bridge(pin, config.get("twilio_path_secret"), config.get("twilio_allowed_callers"),
                   config.get("twilio_public_host"), allowed_login=os.environ.get("VOICE_ALLOWED_LOGIN", ""),
                   fallback_voice_url=config.get("twilio_fallback_voice_url") or "",
-                  stale_s=int(config.get("twilio_stale_s")) if config.get("twilio_reaper") else 0)
+                  stale_s=int(config.get("twilio_stale_s")) if config.get("twilio_reaper") else 0,
+                  auth_mode=config.get("twilio_auth"), greeting_name=str(config.get("owner")).split()[0] if config.get("owner") else "")
 
 
 async def run_forever():

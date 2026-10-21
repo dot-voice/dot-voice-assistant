@@ -134,6 +134,117 @@ class TestBridgeHttp(unittest.IsolatedAsyncioTestCase):
             tb.Bridge(PIN, "short", [CALLER], HOST)
 
 
+class TestSpokenPhrase(unittest.IsolatedAsyncioTestCase):
+    PHRASE = "purple walrus sings quietly"
+
+    async def asyncSetUp(self):
+        self.logs = []
+        self._log = tb.log
+        tb.log = self.logs.append
+        self.bridge = make_bridge(auth_mode="phrase", phrase_fn=lambda: self.PHRASE, greeting_name="Sam")
+        self.server = await tb.serve(self.bridge, "127.0.0.1", 0)
+        self.port = self.server.sockets[0].getsockname()[1]
+
+    async def asyncTearDown(self):
+        tb.log = self._log
+        self.server.close()
+        await self.server.wait_closed()
+
+    def voice(self):
+        return http_get(self.port, "/tw/%s/voice?From=%%2B15550001111&CallSid=CA1" % SECRET)
+
+    def say(self, text, sid="CA1"):
+        from urllib.parse import quote
+        return http_get(self.port, "/tw/%s/phrase?From=%%2B15550001111&CallSid=%s&SpeechResult=%s" % (SECRET, sid, quote(text)))
+
+    def digits(self, d, sid="CA1"):
+        return http_get(self.port, "/tw/%s/phrase?From=%%2B15550001111&CallSid=%s&Digits=%s" % (SECRET, sid, d))
+
+    async def test_greeting_gathers_speech_and_dtmf(self):
+        _, body = await self.voice()
+        self.assertIn("Hi Sam.", body)
+        self.assertIn('input="speech dtmf"', body)
+        self.assertIn("https://%s/tw/%s/phrase" % (HOST, SECRET), body)
+        self.assertNotIn("<Stream", body)
+
+    async def test_right_phrase_connects_with_a_token(self):
+        _, body = await self.say("Purple walrus, sings quietly.")
+        self.assertIn("<Connect><Stream", body)
+        tok = re.search(r'<Parameter name="token" value="([^"]+)"', body).group(1)
+        self.assertTrue(self.bridge.tokens.consume(tok))
+
+    async def test_wrong_phrase_is_refused(self):
+        _, body = await self.say("hey dot")
+        self.assertNotIn("<Stream", body)
+        self.assertIn("<Gather", body)
+
+    async def test_near_miss_stt_variant_is_accepted(self):
+        _, body = await self.say("ok the purple walrus sings quietly")
+        self.assertIn("<Stream", body)
+        _, body = await self.say("purple walrus sing quietly")   # a long word missing is refused
+        self.assertNotIn("<Stream", body)
+
+    def test_normalize_and_score(self):
+        self.assertEqual(tb.normalize_phrase("  Hey, Dot!  Okay. "), "hey dot ok")
+        ok, ratio = tb.phrase_score("purple walrus sings quietly", self.PHRASE)
+        self.assertTrue(ok)
+        self.assertEqual(ratio, 1.0)
+        self.assertFalse(tb.phrase_score("", self.PHRASE)[0])
+
+    async def test_dtmf_falls_back_to_the_pin(self):
+        _, body = await self.digits(PIN)
+        self.assertIn("<Stream", body)
+        _, body = await self.digits("000000", sid="CA2")
+        self.assertNotIn("<Stream", body)
+
+    async def test_three_misses_hang_up_and_five_lock_everything(self):
+        _, b1 = await self.say("nope one")
+        _, b2 = await self.say("nope two")
+        _, b3 = await self.say("nope three")
+        self.assertIn("<Gather", b1)
+        self.assertIn("<Gather", b2)
+        self.assertIn("<Hangup/>", b3)
+        self.assertNotIn("<Gather", b3)
+        await self.say("nope four", sid="CB")
+        await self.say("nope five", sid="CB")
+        _, body = await self.say(self.PHRASE, sid="CC")   # right phrase while locked is refused
+        self.assertNotIn("<Stream", body)
+        _, body = await self.digits(PIN, sid="CC")
+        self.assertNotIn("<Stream", body)
+
+    async def test_phrase_never_reaches_the_log(self):
+        await self.say(self.PHRASE)
+        await self.say("some secret words spoken wrongly")
+        text = " ".join(self.logs).lower()
+        self.assertIn("phrase ok", text)
+        self.assertIn("phrase no match score=", text)
+        for w in ("purple", "walrus", "secret words"):
+            self.assertNotIn(w, text)
+
+    async def test_no_stored_phrase_falls_back_to_the_pin_prompt(self):
+        self.bridge.phrase_fn = lambda: ""
+        _, body = await self.voice()
+        self.assertIn('input="dtmf"', body)
+        _, body = await self.say("anything")
+        self.assertNotIn("<Stream", body)
+
+    async def test_pin_mode_default_ignores_the_phrase(self):
+        self.bridge.auth_mode = "pin"
+        _, body = await self.voice()
+        self.assertIn('input="dtmf"', body)
+        _, body = await self.say(self.PHRASE)
+        self.assertNotIn("<Stream", body)
+
+    def test_set_phrase_normalizes_and_saves_to_the_keychain(self):
+        import set_phrase
+        calls = []
+        n = set_phrase.save("  Purple, Walrus sings QUIETLY ", run=lambda cmd, **k: calls.append(cmd))
+        self.assertEqual(n, 4)
+        self.assertEqual(calls[0][calls[0].index("-w") + 1], "purple walrus sings quietly")
+        self.assertIn("dot-voice-phrase", calls[0])
+        self.assertIn("-U", calls[0])
+
+
 class TestStreamTokens(unittest.TestCase):
     def test_token_is_single_use(self):
         t = tb.StreamTokens()

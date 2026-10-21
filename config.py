@@ -46,6 +46,7 @@ DEFAULTS = {
     "reminder_words": ["remind me", "reminder", "set an alarm", "wake me"],
     "twilio_path_secret": "",        # phone bridge: long random URL token (>= 24 chars); empty = bridge refuses to start
     "twilio_allowed_callers": [],    # phone bridge: E.164 numbers allowed to call; empty = reject everyone
+    "twilio_auth": "pin",            # phone sign-in: "pin" (keypad) or "phrase" (spoken passphrase in Keychain, PIN still works)
     "twilio_public_host": "",        # phone bridge: public host name of the Funnel, e.g. host.tailnet.ts.net
     "twilio_fallback_voice_url": "",  # phone bridge: callers not on the allowlist are redirected here (empty = reject)
     "call_recap": False,             # R38: write logs/recaps/<date>-<time>.md when a Live call ends
