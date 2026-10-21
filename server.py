@@ -41,6 +41,7 @@ import updates  # noqa: E402
 import askmodel  # noqa: E402
 import handoff as handoff_mod  # noqa: E402
 import propfacts  # noqa: E402
+import nextevents  # noqa: E402
 import callrecap  # noqa: E402
 from tts import FakeTextToSpeech, default_tts, find_and_store_qwen_key, QwenTextToSpeech  # noqa: E402
 import realtime  # noqa: E402
@@ -634,6 +635,17 @@ class LiveTools:
         except Exception:
             out = "Could not send to Telegram, tell the caller it failed."
         log_line("live_tool=send_to_phone kind=%s ok=%s" % (kind or "-", "yes" if ok else "no"), self.call.svc.turn_log)
+        return out
+
+    async def next_events(self, hours=12):
+        """R45 (P27): her next calendar events, read-only, from config calendar_list_cmd. Never raises; titles are never logged."""
+        t0 = time.monotonic()
+        n = -1
+        try:
+            out, n = await nextevents.next_events(hours if hours else 12)
+        except Exception:
+            out = "I could not read your calendar just now."
+        log_line("live_tool=next_events n=%d ms=%d" % (n, int((time.monotonic() - t0) * 1000)), self.call.svc.turn_log)
         return out
 
     async def _ask_model_bg(self, key, question):

@@ -92,6 +92,13 @@ def build_tools():
              "kind": {"type": "string", "enum": ["directions", "note"], "description": "directions for an address, note for anything else."},
              "text": {"type": "string", "description": "The address (directions) or the text to send (note), at most 1000 characters."}},
              "required": ["kind", "text"]}},
+        {"type": "function", "name": "next_events",
+         "description": "Read-only: the caller's next calendar events with start time, title, location and any overlaps. Call it when "
+                        "the caller asks what's next, what's my next appointment, what's on my calendar, or what is my day. "
+                        "Say the first one or two events briefly; mention a conflict if the result has one; say the location if she asks where. "
+                        "It cannot add or change events.",
+         "parameters": {"type": "object", "properties": {
+             "hours": {"type": "integer", "description": "How many hours ahead to look, default 12."}}}},
     ]
 
 
@@ -587,6 +594,13 @@ class LiveBridge:
             if not send_fn:
                 return "Sending to the phone is not available."
             return await send_fn(args.get("kind"), args.get("text"))
+        elif name == "next_events":   # R45: read-only calendar; private, so sign-in is required
+            if not getattr(self, "signed_in", False):
+                return "Sign-in is needed before I can read your calendar."
+            ev_fn = getattr(self.tools_impl, "next_events", None)
+            if not ev_fn:
+                return "The calendar is not available."
+            return await ev_fn(args.get("hours"))
         else:
             return "failed: unknown tool"
 
