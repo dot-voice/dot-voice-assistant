@@ -43,6 +43,7 @@ import handoff as handoff_mod  # noqa: E402
 import propfacts  # noqa: E402
 import lastcall  # noqa: E402
 import nextevents  # noqa: E402
+import unreadsum  # noqa: E402
 import callrecap  # noqa: E402
 import callback  # noqa: E402
 from tts import FakeTextToSpeech, default_tts, find_and_store_qwen_key, QwenTextToSpeech  # noqa: E402
@@ -662,6 +663,17 @@ class LiveTools:
         except Exception:
             out = "I could not read the last call recap just now."
         log_line("live_tool=last_call n=%d ms=%d" % (cnt, int((time.monotonic() - t0) * 1000)), self.call.svc.turn_log)
+        return out
+
+    async def unread_digest(self, since_hours=12):
+        """R48 (P29): digest of new client messages, read-only. Never raises; names and text are never logged."""
+        t0 = time.monotonic()
+        n = -1
+        try:
+            out, n = await asyncio.to_thread(unreadsum.unread_digest, since_hours if since_hours else 12)
+        except Exception:
+            out = unreadsum.NONE_TEXT
+        log_line("live_tool=unread_digest n=%d ms=%d" % (n, int((time.monotonic() - t0) * 1000)), self.call.svc.turn_log)
         return out
 
     async def _ask_model_bg(self, key, question):

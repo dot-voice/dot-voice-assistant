@@ -105,6 +105,12 @@ def build_tools():
                         "from the last call. Say briefly what was discussed and the open items. n is how many recent calls, default 1.",
          "parameters": {"type": "object", "properties": {
              "n": {"type": "integer", "description": "How many recent calls to read, 1 to 3, default 1."}}}},
+        {"type": "function", "name": "unread_digest",
+         "description": "Read-only: a short digest of new messages (email, iMessage, WeChat) with the ones that need a reply first. Call it when "
+                        "the caller asks any new messages, anything from clients, anything new, or who do I need to reply to. "
+                        "Say the count and the first two or three items briefly. since_hours is how far back, default 12. It cannot send or reply.",
+         "parameters": {"type": "object", "properties": {
+             "since_hours": {"type": "integer", "description": "How many hours back to look, default 12."}}}},
     ]
 
 
@@ -614,6 +620,13 @@ class LiveBridge:
             if not lc_fn:
                 return "The last call recap is not available."
             return await lc_fn(args.get("n"))
+        elif name == "unread_digest":   # R48: read-only message digest; private, so sign-in is required
+            if not getattr(self, "signed_in", False):
+                return "Sign-in is needed before I can read your messages."
+            ud_fn = getattr(self.tools_impl, "unread_digest", None)
+            if not ud_fn:
+                return "The message digest is not available."
+            return await ud_fn(args.get("since_hours"))
         else:
             return "failed: unknown tool"
 

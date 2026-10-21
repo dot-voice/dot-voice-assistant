@@ -45,6 +45,7 @@ DEFAULTS = {
     "property_lookup_timeout_s": 8,
     "calendar_list_cmd": [],         # R45: command (hours appended as last argument) printing a JSON list of {start,end,title,location}; empty = next_events off
     "calendar_list_timeout_s": 8,
+    "digest_dir": "",                # R48: folder of *.json message digests written by other modules; empty = unread_digest off
     "reminder_words": ["remind me", "reminder", "set an alarm", "wake me"],
     "twilio_path_secret": "",        # phone bridge: long random URL token (>= 24 chars); empty = bridge refuses to start
     "twilio_allowed_callers": [],    # phone bridge: E.164 numbers allowed to call; empty = reject everyone
