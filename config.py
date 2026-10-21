@@ -72,6 +72,8 @@ DEFAULTS = {
     "callback_min_gap_s": 1200,      # R47: at most one call-back per 20 minutes
     "callback_max_per_day": 6,
     "callback_window_s": 3600,       # R47: only replies to hand-offs made in the last 60 minutes
+    "voicemail_pickup": False,       # R49: collect Twilio voicemails left while the Mac was offline (Telegram + spoken update)
+    "voicemail_every_s": 600,        # R49: how often to look, in seconds (also once at start)
 }
 
 

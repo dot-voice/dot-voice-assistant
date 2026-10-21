@@ -46,6 +46,7 @@ import nextevents  # noqa: E402
 import unreadsum  # noqa: E402
 import callrecap  # noqa: E402
 import callback  # noqa: E402
+import voicemail  # noqa: E402
 from tts import FakeTextToSpeech, default_tts, find_and_store_qwen_key, QwenTextToSpeech  # noqa: E402
 import realtime  # noqa: E402
 import transfer  # noqa: E402
@@ -1752,10 +1753,25 @@ async def callback_loop(svc, every_s=5):
         await asyncio.sleep(every_s)
 
 
+async def voicemail_loop(svc, every_s=None):
+    """R49: pick up voicemails left while the Mac was offline, at start and every voicemail_every_s (off unless voicemail_pickup)."""
+    while True:
+        try:
+            if config.get("voicemail_pickup"):
+                await asyncio.to_thread(voicemail.tick, svc.stt.transcribe, log_path=svc.turn_log,
+                                        updates_folder=svc.updates_folder)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log_exception("voicemail loop")
+        await asyncio.sleep(max(60, float(every_s or config.get("voicemail_every_s") or 600)))
+
+
 async def run_forever(args):
     svc = fake_services(args) if args.fake else real_services(args)
     server = await serve(svc, args.host, args.port)
     svc.callback_task = asyncio.create_task(callback_loop(svc))
+    svc.voicemail_task = asyncio.create_task(voicemail_loop(svc))
     print("voice-call listening on %s:%d (PIN in %s). Put HTTPS in front with: tailscale serve --bg %d"
           % (args.host, args.port, PIN_FILE, args.port), flush=True)
     await server.serve_forever()
