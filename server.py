@@ -307,53 +307,68 @@ class LiveTools:
         the call or Live ends."""
         if getattr(self.call, "bug", None):
             return "not sent: this is a bug report, say only: noted"
-        st = self.call.state
-        moved = await self.guard_transfer(words)   # R29: a transfer phrase is never posted as a task
-        if moved:
-            return moved
-        if not replaces_waiting and propfacts.is_property_question(words):   # R35: a property fact is answered here, in seconds
-            facts = await propfacts.lookup(words)
-            if facts:
-                return ("answered from the Vault lookup, nothing was handed off. Say this to the caller in one or two short "
-                        "sentences: %s" % facts)
-        agent = self.reminder_agent(words, agent)
-        if transfer.has_cjk(words) and not summary and self._summary_asked != words:   # R34: carry.py cannot take Chinese
-            self._summary_asked = words
-            return ("not sent yet: call hand_off again with summary = one short English sentence saying what she asked "
-                    "(same agent), then say the line its result gives")
-        sug = await self.suggestion_step(words, agent, replaces_waiting)
-        if isinstance(sug, str):
-            return sug
-        words, agent = sug
-        p = st.pending_handoff
-        if p is not None and not replaces_waiting:
-            await self.post_pending(p)   # a new request, not a correction: both go out
-            p = None
-        if p is not None:
-            p["task"].cancel()
-            if words and words not in p["words"]:
-                p["words"] = (p["words"] + " " + words).strip()
-            p["agent"] = (agent if agent and agent != "AUTO" else None) or p["agent"]
+        t0 = time.monotonic()
+        marks = []
+        mark = lambda name: marks.append("%s=%d" % (name, (time.monotonic() - t0) * 1000))
+        try:
+            st = self.call.state
+            moved = await self.guard_transfer(words)   # R29: a transfer phrase is never posted as a task
+            mark("guard")
+            if moved:
+                return moved
+            if not replaces_waiting and propfacts.is_property_question(words):   # R35: a property fact is answered here, in seconds
+                facts = await propfacts.lookup(words)
+                mark("prop")
+                if facts:
+                    return ("answered from the Vault lookup, nothing was handed off. Say this to the caller in one or two short "
+                            "sentences: %s" % facts)
+            agent = self.reminder_agent(words, agent)
+            if transfer.has_cjk(words) and not summary and self._summary_asked != words:   # R34: carry.py cannot take Chinese
+                self._summary_asked = words
+                return ("not sent yet: call hand_off again with summary = one short English sentence saying what she asked "
+                        "(same agent), then say the line its result gives")
+            sug = await self.suggestion_step(words, agent, replaces_waiting)
+            mark("suggest")
+            if isinstance(sug, str):
+                return sug
+            words, agent = sug
+            p = st.pending_handoff
+            if p is not None and not replaces_waiting:
+                await self.post_pending(p)   # a new request, not a correction: both go out
+                mark("post")
+                p = None
+            if p is not None:
+                p["task"].cancel()
+                if words and words not in p["words"]:
+                    p["words"] = (p["words"] + " " + words).strip()
+                p["agent"] = (agent if agent and agent != "AUTO" else None) or p["agent"]
+                p["task"] = asyncio.create_task(self._post_later(p))
+                row = p.get("row")
+                if row:
+                    row.update(key=p["agent"] or "AUTO", label=dict(TARGETS).get(p["agent"] or "AUTO", p["agent"] or "AUTO"),
+                               snippet=_short(p["words"], 40))
+                    await channels_push(st)
+                return "updated: the waiting hand-off now goes to %s. Say exactly this and nothing else: \"%s\"" % (
+                    p["agent"] or "the right session", self._say_sent(p["agent"], words))
+            if getattr(self.call, "handoff_count", 0) >= 6:
+                return "limit reached, tell the caller to use the menu"
+            if not agent or agent == "AUTO":   # R28: on a channel, work goes there unless the caller names another
+                ch = getattr(self.call, "target", "AUTO")
+                agent = ch if ch not in ("AUTO", "VOICE") else agent
+            p = {"words": words, "agent": agent, "summary": summary}
+            p["row"] = channel_row_add(st, words, agent, "waiting")
             p["task"] = asyncio.create_task(self._post_later(p))
-            row = p.get("row")
-            if row:
-                row.update(key=p["agent"] or "AUTO", label=dict(TARGETS).get(p["agent"] or "AUTO", p["agent"] or "AUTO"),
-                           snippet=_short(p["words"], 40))
-                await channels_push(st)
-            return "updated: the waiting hand-off now goes to %s. Say exactly this and nothing else: \"%s\"" % (
-                p["agent"] or "the right session", self._say_sent(p["agent"], words))
-        if getattr(self.call, "handoff_count", 0) >= 6:
-            return "limit reached, tell the caller to use the menu"
-        if not agent or agent == "AUTO":   # R28: on a channel, work goes there unless the caller names another
-            ch = getattr(self.call, "target", "AUTO")
-            agent = ch if ch not in ("AUTO", "VOICE") else agent
-        p = {"words": words, "agent": agent, "summary": summary}
-        p["row"] = channel_row_add(st, words, agent, "waiting")
-        p["task"] = asyncio.create_task(self._post_later(p))
-        st.pending_handoff = p
-        await channels_push(st)
-        return "queued for %s, sent in a few seconds unless the caller corrects it. Say exactly this and nothing else: \"%s\"" % (
-            agent or "the right session", self._say_sent(agent, words))
+            st.pending_handoff = p
+            await channels_push(st)
+            return "queued for %s, sent in a few seconds unless the caller corrects it. Say exactly this and nothing else: \"%s\"" % (
+                agent or "the right session", self._say_sent(agent, words))
+        finally:
+            try:
+                total_ms = (time.monotonic() - t0) * 1000
+                if total_ms >= 1000:
+                    log_line("hand_off steps: " + " ".join(marks) + " total=%d" % total_ms, self.call.svc.turn_log)
+            except Exception:
+                pass
 
     def _zh(self, words=""):
         return transfer.has_cjk(words) if words else getattr(self.call, "live_lang", "") == "zh-CN"
