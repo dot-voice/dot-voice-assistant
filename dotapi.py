@@ -37,6 +37,7 @@ CLAUDE = _claude_bin or shutil.which("claude") or "claude"   # launchd PATH may 
 BUSY_S = 180
 STATE_MAX_AGE_S = 600
 HEADLESS_TIMEOUT_S = 300
+DESKTOP_PROC = "disclaimer"
 
 PHONE_RULES = (
     "You are answering the owner by phone through Dot. Reply in English only, at most 3 short spoken sentences, "
@@ -181,7 +182,44 @@ def project_dir(folder, projects=None):
     return os.path.join(base, clean_name)
 
 
-def session_state(role, roles_path=None, projects=None, states_path=None, now=None):
+def desktop_folders(lister=None):
+    try:
+        if lister is not None:
+            res = lister()
+            return list(res) if res is not None else []
+        proc = subprocess.run(
+            ["lsof", "-a", "-d", "cwd", "-c", DESKTOP_PROC, "-Fn"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        paths = []
+        for line in proc.stdout.splitlines():
+            if line.startswith("n"):
+                paths.append(line[1:])
+        return paths
+    except Exception:
+        return []
+
+
+def desktop_open(folder, lister=None):
+    if not folder:
+        return False
+    try:
+        target = os.path.realpath(os.path.expanduser(folder))
+        prefix = target if target.endswith(os.sep) else target + os.sep
+        for p in desktop_folders(lister=lister):
+            if not p:
+                continue
+            rp = os.path.realpath(os.path.expanduser(p))
+            if rp == target or rp.startswith(prefix):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def session_state(role, roles_path=None, projects=None, states_path=None, now=None, lister=None):
     now_ts = now if now is not None else time.time()
     role_u = str(role).strip().upper()
     states_file = states_path or STATES
@@ -207,10 +245,12 @@ def session_state(role, roles_path=None, projects=None, states_path=None, now=No
     except Exception:
         pass
 
-    # 2) else folder unknown -> "unknown"; newest *.jsonl mtime in project_dir within BUSY_S -> "busy"; else "asleep"
+    # 2) else folder unknown -> "unknown"; open desktop -> "live"; newest *.jsonl mtime in project_dir within BUSY_S -> "busy"; else "asleep"
     folder = module_folder(role, roles_path=roles_path)
     if not folder:
         return "unknown"
+    if desktop_open(folder, lister=lister):
+        return "live"
     pdir = project_dir(folder, projects=projects)
     newest_mtime = None
     try:
