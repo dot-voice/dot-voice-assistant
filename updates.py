@@ -1,7 +1,7 @@
 """Replies from the Code sessions, spoken to the owner in the call.
 
 A session that finished something the owner asked for by voice runs:
-    python3 <this folder>/updates.py <ROLE> "<one or two short spoken sentences, English>"
+    python3 <this folder>/updates.py <ROLE> "<one or two short spoken sentences, English>" [--needs-her]
 The update waits in updates/ until a call is open and Dot is quiet, then Dot says it. Files are never deleted:
 a spoken one gets "spoken" set.
 """
@@ -20,7 +20,7 @@ MAX_CHARS = 400
 MAX_AGE_S = 2 * 24 * 3600   # older than two days: stale news, not spoken
 
 
-def post(role, text, folder=FOLDER):
+def post(role, text, folder=FOLDER, needs_her=False):
     role = re.sub(r"[^A-Z0-9-]", "", str(role).upper())[:20] or "SESSION"
     text = " ".join(str(text).split())[:MAX_CHARS]
     if not text:
@@ -32,8 +32,11 @@ def post(role, text, folder=FOLDER):
     while os.path.exists(path):
         n += 1
         path = os.path.join(folder, "%s-%s-%d.json" % (stamp, role, n))
+    rec = {"from": role, "text": text, "created": time.time(), "spoken": False}
+    if needs_her:
+        rec["needs_her"] = True
     with open(path, "w") as f:
-        json.dump({"from": role, "text": text, "created": time.time(), "spoken": False}, f, indent=2)
+        json.dump(rec, f, indent=2)
     return path
 
 
@@ -111,6 +114,7 @@ def spoken_line(rec):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        sys.exit('usage: updates.py <ROLE> "<short spoken update, English>"')
-    print("QUEUED for the call: " + post(sys.argv[1], sys.argv[2]))
+    if len(sys.argv) not in (3, 4) or (len(sys.argv) == 4 and sys.argv[3] != "--needs-her"):
+        sys.exit('usage: updates.py <ROLE> "<short spoken update, English>" [--needs-her]')
+    needs_her = len(sys.argv) == 4 and sys.argv[3] == "--needs-her"
+    print("QUEUED for the call: " + post(sys.argv[1], sys.argv[2], needs_her=needs_her))

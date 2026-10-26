@@ -7,6 +7,7 @@ import json
 import os
 import re
 import time
+from datetime import datetime
 
 import config
 
@@ -84,7 +85,40 @@ def _section(text, name):
     return " ".join(out)
 
 
+FEED = os.environ.get("VOICE_FEED", config.path("feed_path"))
 ROLES_JSON = os.environ.get("VOICE_ROLES_JSON", config.path("roles_json"))
+
+
+def newest_feed(role, feed_path=None, max_bytes=400000):
+    """The newest feed record from this role as {"ts": epoch float, "text": str}, or None. Never raises."""
+    try:
+        p = feed_path or FEED
+        if not p or not os.path.exists(p):
+            return None
+        size = os.path.getsize(p)
+        with open(p, "rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+            chunk = f.read().decode("utf-8", "replace")
+        newest = None
+        for ln in chunk.splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                rec = json.loads(ln)
+                if not isinstance(rec, dict):
+                    continue
+                if rec.get("from_role") == role and "ts" in rec:
+                    ts = datetime.fromisoformat(rec["ts"]).timestamp()
+                    text = str(rec.get("text", ""))
+                    if newest is None or ts >= newest["ts"]:
+                        newest = {"ts": ts, "text": text}
+            except Exception:
+                continue
+        return newest
+    except Exception:
+        return None
 
 
 def session_titles(path=None) -> dict:
@@ -127,8 +161,7 @@ def _role_entry(role, roles_path=None):
         if isinstance(d, dict) and role in (d.get("tasks") or []):
             titles = d.get("task_titles") or {}
             names = {_plain(titles[role])} if titles.get(role) else set()
-            if len(d.get("tasks", [])) == 1:
-                names |= {_plain(d.get("title")), _plain(d.get("session"))}
+            names |= {_plain(d.get("title")), _plain(d.get("session"))}
             return folder, {n for n in names if n}
     return None, set()
 
@@ -306,7 +339,7 @@ def _ago(seconds):
     return "%d hours ago" % h if h < 36 else "%d days ago" % round(h / 24)
 
 
-def direct_status(text, folder=None, now=None, updates_fn=None, titles=None):
+def direct_status(text, folder=None, now=None, updates_fn=None, titles=None, feed_path=None):
     """A spoken answer built only from the session's own words, or None when this is not a one-session status question."""
     if not ASKING.search(text or "") or ORDERING.search(text or ""):
         return None
@@ -318,10 +351,10 @@ def direct_status(text, folder=None, now=None, updates_fn=None, titles=None):
         return overview(folder, now, titles)
     if not role or role in PRIVATE_ROLES:
         return None
-    return session_status(role, folder, now, updates_fn, titles)
+    return session_status(role, folder, now, updates_fn, titles, feed_path=feed_path)
 
 
-def session_status(role, folder=None, now=None, updates_fn=None, titles=None):
+def session_status(role, folder=None, now=None, updates_fn=None, titles=None, feed_path=None):
     """One session's saved next step and its last update, in its own words. No phrase rules: the caller picks the role."""
     folder = folder or CARRYOVER
     now = now or time.time()
@@ -330,18 +363,50 @@ def session_status(role, folder=None, now=None, updates_fn=None, titles=None):
         return None
     name = titles.get(role, role)
     parts = []
+    handover = None
     try:
         d = json.load(open(os.path.join(folder, "TASKS.json"))).get(role) or {}
         path = os.path.join(folder, d["file"])
         mtime = os.path.getmtime(path)
         nxt = _section(open(path, encoding="utf-8").read(), "next step")
-        parts.append("%s saved its notes at %s, %s. Its next step, in its own words: %s" % (
-            name, time.strftime("%H:%M", time.localtime(mtime)), _ago(now - mtime), _first_sentence(nxt) if nxt else "not written"))
-        live = live_line(role, mtime)
-        if live:   # R43: the live session is newer than its handover, so say what it is doing now
-            parts.append("The handover may be out of date. Newer, from the live session: " + live)
+        handover = {"mtime": mtime, "nxt": nxt}
     except (OSError, ValueError, KeyError):
+        handover = None
+
+    cands = []
+    if handover is not None:
+        cands.append((handover["mtime"], "handover", "saved its notes"))
+
+    feed = newest_feed(role, feed_path=feed_path)
+    if feed is not None and isinstance(feed.get("ts"), (int, float)):
+        cands.append((feed["ts"], "feed", str(feed.get("text", ""))[:220]))
+
+    try:
+        live_act = live_activity(role, handover["mtime"] if handover else 0)
+        if live_act:
+            live_str = "live now (%s): %s" % (time.strftime("%H:%M", time.localtime(live_act[0])), live_act[1])
+            cands.append((live_act[0], "live", live_str))
+    except Exception:
+        pass
+
+    handover_ts = handover["mtime"] if handover else -1
+    newer_cands = [c for c in cands if c[1] != "handover" and c[0] > handover_ts]
+    if newer_cands:
+        newer_cands.sort(key=lambda c: c[0], reverse=True)
+        w_ts, _, w_text = newer_cands[0]
+        first_sentence = "%s's latest, at %s (%s): %s" % (
+            name, time.strftime("%H:%M", time.localtime(w_ts)), _ago(now - w_ts), w_text)
+        parts.append(first_sentence)
+        if handover is not None:
+            parts.append("Its next step, in its own words: %s" % (
+                _first_sentence(handover["nxt"]) if handover["nxt"] else "not written"))
+    elif handover is not None:
+        parts.append("%s saved its notes at %s, %s. Its next step, in its own words: %s" % (
+            name, time.strftime("%H:%M", time.localtime(handover["mtime"])), _ago(now - handover["mtime"]),
+            _first_sentence(handover["nxt"]) if handover["nxt"] else "not written"))
+    else:
         parts.append("%s has no saved notes I can read" % name)
+
     try:
         if updates_fn is None:
             from updates import last_update

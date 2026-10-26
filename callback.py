@@ -150,6 +150,8 @@ def candidate(now, items, handoffs, handled, aliases):
         role = str(rec.get("from", "")).upper()
         if role in ("", "TEST"):
             continue
+        if rec.get("needs_her"):
+            return name, path, rec
         keys = {role, aliases.get(role, role)}
         created = float(rec.get("created", 0))
         if any(r in keys and c <= created for c, r in handoffs):

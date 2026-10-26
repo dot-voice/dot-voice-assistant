@@ -230,6 +230,8 @@ class Bridge:
         self.stale_s = stale_s   # R39: a call with no media from Twilio for this long is closed (0 = off)
         self.last_media = time.monotonic()
         self.tries = {}   # CallSid -> wrong PINs so far
+        self.signin_start = {}   # CallSid -> time.time() of first sign-in prompt
+        self.phrase_tries = {}   # CallSid -> spoken tries count
         self.base = "/tw/" + secret
         self.auth_mode, self.phrase_fn, self.greeting_name = auth_mode, phrase_fn, greeting_name
         self.dot_number = str(dot_number or "")   # R47: our own number; an outbound call-back has From = this, To = an allowed caller
@@ -304,11 +306,17 @@ class Bridge:
 
     def _gather_phrase(self, prompt):
         action = "https://%s%s/phrase" % (self.public_host, self.base)
-        return ('<Gather input="speech dtmf" speechTimeout="auto" timeout="6" language="en-US" finishOnKey="#" '
-                'method="GET" action=%s><Say>%s</Say></Gather><Hangup/>' % (quoteattr(action), escape(prompt)))
+        return ('<Gather input="speech dtmf" speechTimeout="1" speechModel="phone_call" enhanced="true" timeout="6" '
+                'language="en-US" finishOnKey="#" method="GET" action=%s><Say>%s</Say></Gather><Hangup/>'
+                % (quoteattr(action), escape(prompt)))
 
     def voice_twiml(self, q) -> str:
         if self._phrase_mode():
+            sid = q.get("CallSid", "")
+            if sid not in self.signin_start:
+                self.signin_start[sid] = time.time()
+            if len(self.signin_start) > 200:
+                self.signin_start.pop(next(iter(self.signin_start)))
             who = (" " + self.greeting_name) if self.greeting_name else ""
             return twiml(self._gather_phrase("Hi%s." % who))
         return twiml(self._gather("Dot here. Enter your PIN, then press pound."))
@@ -318,11 +326,17 @@ class Bridge:
         if q.get("Digits"):
             return self.pin_twiml(q)
         sid = q.get("CallSid", "")
+        tries = self.phrase_tries.get(sid, 0) + 1
+        self.phrase_tries[sid] = tries
+        if len(self.phrase_tries) > 200:
+            self.phrase_tries.pop(next(iter(self.phrase_tries)))
         stored = self.phrase_fn() if self.auth_mode == "phrase" else ""
         left = self.guard.locked_for()
         ok, score = (False, 0.0) if (left or not stored) else phrase_score(q.get("SpeechResult", ""), stored)
         if ok:
-            log("phrase ok")
+            log("phrase ok after_s=%.1f tries=%d" % (time.time() - self.signin_start.get(sid, time.time()), tries))
+            self.signin_start.pop(sid, None)
+            self.phrase_tries.pop(sid, None)
             self.guard.reset()
             return self._connect(sid)
         locked = bool(left)
@@ -335,6 +349,8 @@ class Bridge:
         if len(self.tries) > 200:
             self.tries.pop(next(iter(self.tries)))
         if n >= MAX_PIN_TRIES or locked:
+            self.signin_start.pop(sid, None)
+            self.phrase_tries.pop(sid, None)
             return twiml("<Say>Goodbye.</Say><Hangup/>")
         return twiml(self._gather_phrase("Sorry, say it again."))
 

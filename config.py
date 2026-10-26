@@ -35,6 +35,10 @@ DEFAULTS = {
     "private_roles": [],
     "carryover_dir": "~/.dot/carryover",
     "roles_json": "~/.dot/roles.json",
+    "feed_path": "~/.dot/feed.jsonl",            # R52/R54: shared session feed (jsonl)
+    "session_states": "~/.dot/session_states.json",  # R54: optional role -> state file
+    "claude_bin": "",          # R54: claude CLI for headless module jobs; "" = dotapi's default path
+    "dot_headless": True,      # R54: start a headless job when the hand-off's module session is asleep
     "team_jobs_dir": "~/.dot/team/jobs",
     "rp_id": "localhost",
     "updates_dir": "~/.dot/updates",

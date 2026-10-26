@@ -50,6 +50,8 @@ import voicemail  # noqa: E402
 from tts import FakeTextToSpeech, default_tts, find_and_store_qwen_key, QwenTextToSpeech  # noqa: E402
 import realtime  # noqa: E402
 import transfer  # noqa: E402
+import handoff  # noqa: E402
+import dotapi  # noqa: E402
 
 PORT = 8770
 AUTH_TIMEOUT_S = 20
@@ -94,6 +96,7 @@ STACK_MAX = 10
 SUGGEST_TRANSFERS = True   # R29 switch (tests that predate it turn it off)
 # carry.py aliases: a session that answers under the other name still answers that hand-off (R27)
 ROLE_ALIASES = {"CRM": "VAULT", "VAULT": "CRM", "VIDEO": "MW", "MW": "VIDEO"}
+SKIP_ROUTE = {"VOICE", "ORG", "AUTO"}
 
 
 def _short(text, n):
@@ -482,6 +485,32 @@ class LiveTools:
             log_line("live: held hand-off failed", self.call.svc.turn_log)
             st.notices.append("Sorry, that hand-off did not go through. Please say it again.")   # said when she is quiet
 
+    async def _route_after_post(self, role, words):
+        try:
+            if role in SKIP_ROUTE or role in (config.get("private_roles") or []) or config.get("dot_headless") is False:
+                return
+            state = await asyncio.to_thread(dotapi.session_state, role)
+            log_line("dotapi: role=%s state=%s" % (role, state), self.call.svc.turn_log)
+            if state == "asleep":
+                line = await asyncio.to_thread(
+                    dotapi.ask_module,
+                    role,
+                    words,
+                    handoff.tell_role,
+                    None,
+                    lambda m: log_line(m, self.call.svc.turn_log),
+                    lambda r: "asleep",
+                )
+            elif state in ("busy", "live"):
+                line = "%s is awake, I passed it on. I will tell you when it replies." % role.title()
+            else:
+                return
+            self.call.state.notices.append(line)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log_exception("route_after_post")
+
     async def _post(self, words, agent, row=None, summary=None):
         try:
             ctx = self.call.warm_context(words)
@@ -503,6 +532,10 @@ class LiveTools:
                 await now.send({"type": "handoff", "id": rec.get("id", ""), "text": words, "to": rec.get("to", "")})
             except Exception:
                 pass
+            t = asyncio.create_task(self._route_after_post(str(rec.get("to") or ""), words))
+            st = self.call.state
+            st.ask_tasks.add(t)
+            t.add_done_callback(st.ask_tasks.discard)
             return "posted to %s" % rec.get("to", agent or "")
         reason = (rec.get("post_error") if rec else "") or "failed to post"
         return "not sent: %s" % reason
@@ -1756,10 +1789,22 @@ def fake_services(args):
     return svc
 
 
+async def dot_tells_tick(svc):
+    try:
+        n = await asyncio.to_thread(dotapi.pump_tells)
+        if n:
+            log_line("dotapi: %d tell(s) for Dot queued" % n, getattr(svc, "turn_log", None))
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
+
+
 async def callback_loop(svc, every_s=5):
     """R47: look for session replies to hand-offs while no call is open; callback.tick decides (off unless callback_on_reply)."""
     while True:
         try:
+            await dot_tells_tick(svc)
             if config.get("callback_on_reply"):
                 live = any(st.call is not None for st in svc.call_states)
                 items = await asyncio.to_thread(updates.pending, svc.updates_folder)
