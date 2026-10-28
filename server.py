@@ -1459,6 +1459,9 @@ class Call:
                                 await self.send({"type": "live_ok"})
                                 log_line("live: on (%s)" % self.live_lang, self.svc.turn_log)
                                 self.recap_start()
+                                if not getattr(self, "greeted", False):   # R56: speak first, never 58 s of silence
+                                    self.greeted = True
+                                    self.state.notices.insert(0, "%s here. Go ahead." % config.get("assistant"))
                             except Exception as e:
                                 self.live = None
                                 self.live_pending = False

@@ -409,6 +409,18 @@ class ServerLiveTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(call.live_pending)
         self.assertTrue(any(json.loads(m).get("type") == "live_ok" for m in ws.sent if isinstance(m, str)))
 
+    async def test_live_on_greets_once_per_call(self):
+        """R56: her words 2026-10-28 "then authentication still took a loooooong time" - 58 s of silence after sign-in."""
+        on = json.dumps({"type": "live", "on": True})
+        ws = FakeCallWS([on, on, None])
+        call = server.Call(ws, self.svc)
+        call.authenticate = mock.AsyncMock(return_value=True)
+        with mock.patch("realtime.LiveBridge", FakeLiveBridge):
+            await call.run()
+        self.assertTrue(call.greeted)
+        line = "%s here. Go ahead." % server.config.get("assistant")
+        self.assertEqual(call.state.notices.count(line), 1)
+
     async def test_binary_while_live_feeds_audio_no_turn(self):
         pcm = b"\x01\x02" * 160
         ws = FakeCallWS([pcm, None])
