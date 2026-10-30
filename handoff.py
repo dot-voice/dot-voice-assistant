@@ -83,6 +83,15 @@ class FileHandoff(Handoff):
         rec["to"] = target
         if self.post and target == "VOICE":
             rec["posted"] = True   # about the call itself: stays here in handoff/, the VOICE session works it
+            words = " ".join(str(spoken or task or "").split())
+            if CJK.search(words):
+                words = " ".join(CJK_OR_PUNCT.sub(" ", str(summary or task or words)).split())
+            if words:
+                try:
+                    self.teller("VOICE", "%s said by voice (exact words): \"%s\"" % (config.get("owner"), words[:480]))
+                    rec["told"] = True
+                except Exception:
+                    pass
         elif self.post:
             # The exact words only, never Dot's summary. Dot's task line stays in the local json for reference.
             words = " ".join(str(spoken or "").split())

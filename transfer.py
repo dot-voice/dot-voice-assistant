@@ -72,10 +72,11 @@ POLITE_ZH = ("\u9891\u9053", "\u4f1a\u8bdd", "\u90a3\u8fb9", "\u4e00\u4e0b", "\u
 
 _NAME_EN = r"(?P<n>[a-z0-9+&'\-]+(?:\s+[a-z0-9+&'\-]+){0,5})"
 _NAME_EN_LOOSE = r"(?P<n>[^.!?,;]{1,50})"
-_ME = r"(?:\s+(?:me|us|the\s+call|this\s+call|my\s+call))?"
+_ME_REQ = r"\s+(?:me|us|the\s+call|this\s+call|my\s+call)"
+_ME = r"(?:" + _ME_REQ + r")?"
 STRONG_EN = re.compile(r"\b(?:transfer|connect|patch|put)\b" + _ME + r"(?:\s+(?:through|over))?\s+(?:to|with)\s+(?:the\s+)?" +
                        _NAME_EN_LOOSE)
-WEAK_EN = re.compile(r"\b(?:switch|change|take|send|pass|bring|go)\b" + _ME + r"(?:\s+over)?\s+(?:back\s+)?to\s+(?:the\s+)?" +
+WEAK_EN = re.compile(r"\b(?:(?:switch|change|go)" + _ME + r"|(?:send|pass|take|bring)" + _ME_REQ + r")(?:\s+over)?\s+(?:back\s+)?to\s+(?:the\s+)?" +
                      _NAME_EN_LOOSE)
 BACK_EN = re.compile(r"\b(?:(?:transfer|put|switch|take|send|bring)\b" + _ME + r"\s+back\b|switch\s+back\b|"
                      r"back\s+to\s+(?:dot|the\s+front\s+desk|the\s+main\s+(?:desk|line|menu))\b)")
@@ -311,8 +312,11 @@ def parse(text):
             clear = bool(strong and (
                 (len(name.split()) <= 3 and re.search(r"\b(?:transfer|put|connect|patch|switch)\s+me\b", low))
                 or re.search("\u8f6c\u63a5|\u63a5\u901a|\u8f6c\u7ed9\u6211|\u628a\u6211\u8f6c", t)))
-            return {"kind": "to", "name": name, "strong": clear}
+            return {"kind": "to", "name": name, "strong": clear, "weak": rx is not STRONG_EN}
     return None
+
+
+NEG_WORDS = re.compile(r"\b(?:why|don't|dont|do\s+not|not|never)\b|\u4e3a\u4ec0\u4e48|\u4e0d\u8981|\u522b", re.I)
 
 
 def resolve_words_polite(name):
@@ -334,6 +338,8 @@ def plan(text, targets, aliases=(), titles=None):
         return ("prev",)
     if p["kind"] == "back":
         return ("to", "AUTO")
+    if p.get("weak") and NEG_WORDS.search(str(text or "")):
+        return None
     keys = resolve_words_all(p["name"], targets, aliases, titles)
     if len(keys) == 1:
         return ("to", keys[0])

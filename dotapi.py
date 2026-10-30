@@ -15,6 +15,7 @@ import threading
 import time
 
 import config
+from diag import log_line
 import updates
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -22,6 +23,7 @@ FEED = os.environ.get("VOICE_FEED", config.path("feed_path"))
 CURSOR = os.path.join(HERE, "data", "feed_cursor.json")
 STATES = config.path("session_states")
 PROJECTS = os.path.expanduser("~/.claude/projects")
+SESSIONS_DIR = os.path.expanduser("~/Library/Application Support/Claude/claude-code-sessions")
 
 try:
     ROLES = config.path("roles_json")
@@ -182,11 +184,8 @@ def project_dir(folder, projects=None):
     return os.path.join(base, clean_name)
 
 
-def desktop_folders(lister=None):
+def _lsof_folders():
     try:
-        if lister is not None:
-            res = lister()
-            return list(res) if res is not None else []
         proc = subprocess.run(
             ["lsof", "-a", "-d", "cwd", "-c", DESKTOP_PROC, "-Fn"],
             capture_output=True,
@@ -202,13 +201,62 @@ def desktop_folders(lister=None):
         return []
 
 
-def desktop_open(folder, lister=None):
+def _sessions_dir_folders(sessions_dir):
+    if not sessions_dir:
+        return []
+    try:
+        root_dir = os.path.expanduser(sessions_dir)
+        if not os.path.isdir(root_dir):
+            return []
+        folders = []
+        seen = 0
+        for dirpath, _dirnames, filenames in os.walk(root_dir):
+            for fname in filenames:
+                if not fname.endswith(".json"):
+                    continue
+                if seen >= 2000:
+                    return folders
+                seen += 1
+                fpath = os.path.join(dirpath, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except Exception:
+                    continue
+                if not isinstance(data, dict) or data.get("isArchived"):
+                    continue
+                for key in ("cwd", "originCwd"):
+                    val = data.get(key)
+                    if isinstance(val, str) and val and (key == "cwd" or val != data.get("cwd")):
+                        folders.append(val)
+        return folders
+    except Exception:
+        return []
+
+
+def desktop_folders(lister=None, sessions_dir=None):
+    try:
+        if lister is not None:
+            res = lister()
+            paths = list(res) if res is not None else []
+            if sessions_dir is not None:
+                paths.extend(_sessions_dir_folders(sessions_dir))
+            return paths
+        paths = _lsof_folders()
+        sdir = SESSIONS_DIR if sessions_dir is None else sessions_dir
+        paths.extend(_sessions_dir_folders(sdir))
+        return paths
+    except Exception:
+        return []
+
+
+def desktop_open(folder, lister=None, sessions_dir=None):
     if not folder:
         return False
     try:
         target = os.path.realpath(os.path.expanduser(folder))
         prefix = target if target.endswith(os.sep) else target + os.sep
-        for p in desktop_folders(lister=lister):
+        for p in desktop_folders(lister=lister, sessions_dir=sessions_dir):
             if not p:
                 continue
             rp = os.path.realpath(os.path.expanduser(p))
@@ -219,7 +267,7 @@ def desktop_open(folder, lister=None):
         return False
 
 
-def session_state(role, roles_path=None, projects=None, states_path=None, now=None, lister=None):
+def session_state(role, roles_path=None, projects=None, states_path=None, now=None, lister=None, sessions_dir=None):
     now_ts = now if now is not None else time.time()
     role_u = str(role).strip().upper()
     states_file = states_path or STATES
@@ -249,7 +297,19 @@ def session_state(role, roles_path=None, projects=None, states_path=None, now=No
     folder = module_folder(role, roles_path=roles_path)
     if not folder:
         return "unknown"
-    if desktop_open(folder, lister=lister):
+    if lister is not None:
+        try:
+            lsof_paths = list(lister() or [])
+        except Exception:
+            lsof_paths = []
+        sess_paths = _sessions_dir_folders(sessions_dir) if sessions_dir is not None else []
+    else:
+        lsof_paths = _lsof_folders()
+        sdir = SESSIONS_DIR if sessions_dir is None else sessions_dir
+        sess_paths = _sessions_dir_folders(sdir)
+    if not lsof_paths:
+        log_line("dotapi: lsof empty, sessions_dir folders=%d" % len(sess_paths))
+    if desktop_open(folder, lister=lambda: lsof_paths + sess_paths):
         return "live"
     pdir = project_dir(folder, projects=projects)
     newest_mtime = None
@@ -383,41 +443,43 @@ def run_headless(role, words, folder=None, model="sonnet", runner=subprocess.run
                 }
 
             wall_seconds = round(time.time() - wall_start, 2)
+            err_tail = ""
             if proc.returncode != 0:
-                return {
-                    "ok": False,
-                    "text": f"headless failed with exit {proc.returncode}",
-                    "seconds": wall_seconds,
-                    "tokens": 0,
-                    "cost_usd": 0.0,
-                    "model": model,
-                }
+                stderr = getattr(proc, "stderr", "") or ""
+                err_tail = stderr.strip()[-300:]
+                log_line("dotapi: headless exit=%s err=%s" % (proc.returncode, " ".join(err_tail.split())[-120:]))
 
             stdout = getattr(proc, "stdout", "") or ""
             first_brace = stdout.find("{")
             last_brace = stdout.rfind("}")
             if first_brace == -1 or last_brace == -1 or last_brace < first_brace:
-                return {
+                res = {
                     "ok": False,
-                    "text": "no json in stdout",
+                    "text": f"headless failed with exit {proc.returncode}" if proc.returncode != 0 else "no json in stdout",
                     "seconds": wall_seconds,
                     "tokens": 0,
                     "cost_usd": 0.0,
                     "model": model,
                 }
+                if proc.returncode != 0:
+                    res["error"] = err_tail
+                return res
 
             json_str = stdout[first_brace : last_brace + 1]
             try:
                 data = json.loads(json_str)
             except Exception:
-                return {
+                res = {
                     "ok": False,
-                    "text": "invalid json in stdout",
+                    "text": f"headless failed with exit {proc.returncode}" if proc.returncode != 0 else "invalid json in stdout",
                     "seconds": wall_seconds,
                     "tokens": 0,
                     "cost_usd": 0.0,
                     "model": model,
                 }
+                if proc.returncode != 0:
+                    res["error"] = err_tail
+                return res
 
             is_error = bool(data.get("is_error", False))
             result_raw = data.get("result") or data.get("text") or ""
@@ -432,14 +494,18 @@ def run_headless(role, words, folder=None, model="sonnet", runner=subprocess.run
             )
             cost_usd = float(data.get("total_cost_usd") or data.get("cost_usd") or 0.0)
 
-            return {
-                "ok": not is_error,
-                "text": text if not is_error else (text or "error"),
+            ok = (not is_error) and (proc.returncode == 0 or bool(text))
+            res = {
+                "ok": ok,
+                "text": text if ok else (text or (f"headless failed with exit {proc.returncode}" if proc.returncode != 0 else "error")),
                 "seconds": wall_seconds,
                 "tokens": tokens,
                 "cost_usd": cost_usd,
                 "model": model,
             }
+            if proc.returncode != 0:
+                res["error"] = err_tail
+            return res
         finally:
             if acquired:
                 try:
@@ -471,8 +537,15 @@ def ask_module(role, words, tell_fn, post_fn=None, log_fn=None, state_fn=None, h
         def job():
             fn = headless_fn or run_headless
             r = fn(role, words)
-            res_text = r["text"] if r.get("ok") else ("the background job did not finish: " + str(r.get("text", "")))
             target_post = post_fn or updates.post
+            if r.get("ok"):
+                res_text = r["text"]
+            else:
+                try:
+                    tell_fn(role, words)
+                except Exception:
+                    pass
+                res_text = "%s could not finish it in the background, so I passed it to the %s session; it will answer when it is open." % (Role, Role)
             try:
                 target_post(role, res_text)
             except Exception:
@@ -482,10 +555,11 @@ def ask_module(role, words, tell_fn, post_fn=None, log_fn=None, state_fn=None, h
                     "dotapi: role=%s path=headless ok=%s seconds=%.1f tokens=%d model=%s"
                     % (role, r.get("ok"), float(r.get("seconds", 0.0)), int(r.get("tokens", 0)), r.get("model", ""))
                 )
-            try:
-                tell_fn(role, "Dot headless job did this for her (her words: %s): %s" % (words[:200], str(r.get("text", ""))[:300]))
-            except Exception:
-                pass
+            if r.get("ok"):
+                try:
+                    tell_fn(role, "Dot headless job did this for her (her words: %s): %s" % (words[:200], str(r.get("text", ""))[:300]))
+                except Exception:
+                    pass
 
         sp = spawn or (lambda f: threading.Thread(target=f, daemon=True).start())
         sp(job)

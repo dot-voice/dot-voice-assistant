@@ -297,7 +297,7 @@ class TestHandoff(unittest.TestCase):
         sent = []
         h = handoff.FileHandoff(folder=tempfile.mkdtemp(), post=True, role="AUTO", teller=lambda r, t: sent.append(r) or "ok")
         self.assertEqual(h.create("Fix the microphone prompt", "mic keeps asking")["to"], "VOICE")
-        self.assertEqual(sent, [])   # stays local for the VOICE session
+        self.assertEqual(sent, ["VOICE"])   # v66: kept local and also told to the VOICE session
 
     def test_unknown_role_falls_back_to_org_and_chinese_is_not_sent(self):
         sent = []

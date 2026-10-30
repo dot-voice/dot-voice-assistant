@@ -351,10 +351,15 @@ class LiveTools:
                 return "updated: the waiting hand-off now goes to %s. Say exactly this and nothing else: \"%s\"" % (
                     p["agent"] or "the right session", self._say_sent(p["agent"], words))
             if getattr(self.call, "handoff_count", 0) >= 6:
-                return "limit reached, tell the caller to use the menu"
-            if not agent or agent == "AUTO":   # R28: on a channel, work goes there unless the caller names another
-                ch = getattr(self.call, "target", "AUTO")
-                agent = ch if ch not in ("AUTO", "VOICE") else agent
+                return "limit reached: 6 hand-offs this call already; tell the caller she can call again for more, or say it to the session directly"
+            ch = getattr(self.call, "target", "AUTO")
+            model_agent = agent
+            if ch not in ("AUTO", "VOICE") and (
+                not agent or agent == "AUTO"
+                or (agent == "ORG" and not re.search(r"\b(?:org|organizer)\b", str(words or ""), re.I))
+            ):   # R28: on a channel, work goes there unless the caller names another
+                agent = ch
+            log_line("hand_off: agent=%s channel=%s sent=%s" % (model_agent, ch, agent), self.call.svc.turn_log)
             p = {"words": words, "agent": agent, "summary": summary}
             p["row"] = channel_row_add(st, words, agent, "waiting")
             p["task"] = asyncio.create_task(self._post_later(p))
@@ -1382,7 +1387,7 @@ class Call:
         """Keep the speech model and the front-desk process resident in memory while a call is open (idle processes get swapped out on this Mac)."""
         try:
             t0 = time.monotonic()
-            await asyncio.gather(asyncio.to_thread(self._touch_stt), asyncio.to_thread(self._prepare_desk), return_exceptions=True)
+            await asyncio.gather(asyncio.to_thread(self._touch_stt, True), asyncio.to_thread(self._prepare_desk), return_exceptions=True)
             log_line("call: warm-up took %d ms" % int((time.monotonic() - t0) * 1000), self.svc.turn_log)
             n = 0
             while True:
@@ -1397,8 +1402,9 @@ class Call:
         except Exception as e:
             log_line("keepalive stopped: %s" % type(e).__name__)
 
-    def _touch_stt(self):
-        if self.ears == "mac":   # when the phone listens, leave the Mac speech model alone (it only costs memory)
+    def _touch_stt(self, start=False):
+        if self.ears == "mac" or (self.ears == "phone" and (start or not getattr(self, "_stt_warmed", False))):
+            self._stt_warmed = True
             self.svc.stt.transcribe(KEEPALIVE_CLIP)
 
     def _ping_desk(self):

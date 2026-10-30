@@ -27,8 +27,8 @@ class TestFastSignin(unittest.TestCase):
     def test_phrase_gather_is_fast_and_private(self):
         x = self.b.voice_twiml({"CallSid": "CA1"})
         self.assertIn('speechTimeout="1"', x)
-        self.assertIn('speechModel="phone_call"', x)
-        self.assertIn('enhanced="true"', x)
+        self.assertIn('speechModel="deepgram_nova-3"', x)   # R57
+        self.assertNotIn("enhanced", x)
         self.assertNotIn("hints", x)
         self.assertNotIn("harbor", x)
 

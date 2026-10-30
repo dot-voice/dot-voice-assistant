@@ -57,5 +57,26 @@ class TestG6(unittest.TestCase):
         self.assertFalse(dotapi.desktop_open("", lister=lambda: ["/"]))
 
 
+class TestV66SessionsDir(unittest.TestCase):
+    """v66: an open Desktop session JSON (not archived) with cwd = the module folder counts as open."""
+
+    def test_open_session_json_counts(self):
+        import json as _json
+        import tempfile
+        import dotapi
+        with tempfile.TemporaryDirectory() as d:
+            mod = os.path.join(d, "refarm")
+            os.makedirs(mod)
+            sess = os.path.join(d, "sessions", "a", "b")
+            os.makedirs(sess)
+            with open(os.path.join(sess, "local_1.json"), "w") as f:
+                _json.dump({"cwd": mod, "isArchived": False}, f)
+            with open(os.path.join(sess, "local_2.json"), "w") as f:
+                _json.dump({"cwd": os.path.join(d, "other"), "isArchived": True}, f)
+            sd = os.path.join(d, "sessions")
+            self.assertTrue(dotapi.desktop_open(mod, lister=lambda: [], sessions_dir=sd))
+            self.assertFalse(dotapi.desktop_open(os.path.join(d, "other"), lister=lambda: [], sessions_dir=sd))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3,6 +3,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import time
 
 import websockets
@@ -112,8 +113,9 @@ def build_tools():
          "parameters": {"type": "object", "properties": {
              "since_hours": {"type": "integer", "description": "How many hours back to look, default 12."}}}},
         {"type": "function", "name": "talk_mode",
-         "description": "Switch talk-it-through mode. on=true when the caller says she just needs to talk, she is stressed, can we just talk, "
-                        "or clearly sounds upset; on=false when she says back to work or asks for a work task. It only sets a private flag "
+         "description": "Switch talk-it-through mode. on=true only when the caller says she just needs to talk, she is stressed, can we just talk, "
+                        "or clearly sounds upset about her life/work (never because she is frustrated or angry with the assistant or about the call/app working badly); "
+                        "on=false when she says back to work or asks for a work task (check, look up, update, send, tell, status, what's new). It only sets a private flag "
                         "(nothing she says in talk mode is kept in the call recap). Then continue the conversation in the right style; "
                         "never mention the flag.",
          "parameters": {"type": "object", "properties": {
@@ -124,9 +126,11 @@ def build_tools():
 TOOLS = build_tools()
 
 TALK_MODE_PROMPT = (
-    " TALK-IT-THROUGH MODE (P30). Enter it when the caller says things like \"I just need to talk\", \"I'm stressed\", \"can we just talk\", "
-    "or clearly sounds upset: call talk_mode with on=true once, then follow this section. Leave it when she says \"back to work\" or asks for a "
-    "work task: call talk_mode with on=false and go back to the normal front desk style. In talk mode you are a warm, calm, unhurried "
+    " TALK-IT-THROUGH MODE (P30). Enter it only when the caller says things like \"I just need to talk\", \"I'm stressed\", \"can we just talk\", "
+    "or clearly sounds upset about her life/work: call talk_mode with on=true once, then follow this section. Never enter talk mode because she "
+    "is frustrated or angry with the assistant or about the call/app working badly. Leave it when she says \"back to work\" or asks for a "
+    "work task - any work request (check, look up, update, send, tell, status, what's new) leaves talk mode first (call talk_mode with on=false) "
+    "and is then done in the normal front desk style. In talk mode you are a warm, calm, unhurried "
     "listener, not a front desk. Listen first. Reflect back what she said in one sentence. Ask one gentle question at a time. Keep every turn "
     "short, one to three sentences, because she is driving. No lists, no lecturing, no toxic positivity, no \"everything will be fine\". Help her "
     "name what is stressing her and, only if she wants it, find one small next step. You may offer a short slow-breathing exercise suited to "
@@ -553,6 +557,18 @@ class LiveBridge:
                 self._snap = None
 
     DUP_HANDOFF_S = 10.0
+    _FILLER_RE = re.compile(r"\b(?:um+|uh+|er+|ah+|oh+|eh+|hm+|mm+|ok(?:ay)?)\b", re.I)
+
+    @classmethod
+    def _handoff_chars(cls, words):
+        low = cls._FILLER_RE.sub(" ", str(words or "").lower())
+        seen = []
+        for tok in re.findall(r"[a-z\u4e00-\u9fff]+", low):
+            tok = re.sub(r"([\u4e00-\u9fff])\1+", r"\1", tok)
+            tok = re.sub(r"([a-z])\1{2,}", r"\1", tok)
+            if tok and tok not in ("\u989d", "\u5443", "\u55ef", "\u554a", "\u54e6") and tok not in seen:
+                seen.append(tok)
+        return "".join(seen)
 
     def _duplicate_handoff(self, args):
         """R33: Gemini sometimes calls hand_off twice for one request (one turn, or a second call right after the first's
@@ -572,12 +588,12 @@ class LiveBridge:
         snap = self._snap
         if name == "hand_off":
             if self.handoff_count >= 6:
-                return "limit reached, tell the caller to use the menu"
+                return "limit reached: 6 hand-offs this call already; tell the caller she can call again for more, or say it to the session directly"
             dup = self._duplicate_handoff(args)
             if dup:
                 return "already handled, do not repeat it. " + dup
             words = await self._get_turn_words()
-            if not words or len(words) < 2:
+            if len(self._handoff_chars(words)) < 3:
                 return "not sent: I did not catch the words, ask the caller to say it again"
             kw = {"replaces_waiting": True} if args.get("replaces_waiting") else {}
             if str(args.get("summary") or "").strip():

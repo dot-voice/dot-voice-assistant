@@ -205,6 +205,11 @@ class StreamTokens:
         return bool(item) and item[1] > self.clock()
 
 
+# R57: Deepgram streams (was Google V1 phone_call + deprecated enhanced: 6.4-7.8 s sign-ins, her words 2026-10-30
+# "the verification is still very slow"). Valid per twilio.com/docs/voice/twiml/gather.
+SPEECH_MODEL = "deepgram_nova-3"
+
+
 def twiml(*inner) -> str:
     return '<?xml version="1.0" encoding="UTF-8"?><Response>' + "".join(inner) + "</Response>"
 
@@ -306,9 +311,9 @@ class Bridge:
 
     def _gather_phrase(self, prompt):
         action = "https://%s%s/phrase" % (self.public_host, self.base)
-        return ('<Gather input="speech dtmf" speechTimeout="1" speechModel="phone_call" enhanced="true" timeout="6" '
+        return ('<Gather input="speech dtmf" speechTimeout="1" speechModel="%s" timeout="6" '
                 'language="en-US" finishOnKey="#" method="GET" action=%s><Say>%s</Say></Gather><Hangup/>'
-                % (quoteattr(action), escape(prompt)))
+                % (SPEECH_MODEL, quoteattr(action), escape(prompt)))
 
     def voice_twiml(self, q) -> str:
         if self._phrase_mode():

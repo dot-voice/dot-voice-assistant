@@ -619,7 +619,7 @@ class ServerLiveTest(unittest.IsolatedAsyncioTestCase):
         call.handoff_count = 6
         tools = server.LiveTools(call)
         res = await tools.hand_off("research area", "CRM")
-        self.assertEqual(res, "limit reached, tell the caller to use the menu")
+        self.assertTrue(res.startswith("limit reached: 6 hand-offs"))
 
     async def test_status_named_session_and_overview(self):
         # 2026-10-11 her real call: "check my tasks" hit a phrase rule and got "No saved status". The model now
